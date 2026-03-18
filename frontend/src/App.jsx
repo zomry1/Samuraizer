@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import React, { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import * as d3 from "d3";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
@@ -36,6 +36,33 @@ function Spinner({ sm }) {
       <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
     </svg>
   );
+}
+
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+
+  componentDidCatch(error, info) {
+    console.error(error, info);
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="p-6 bg-accent-red/10 border border-accent-red/30 rounded-lg text-red-200">
+          <div className="font-bold mb-2">Something went wrong</div>
+          <pre className="text-xs whitespace-pre-wrap">{String(this.state.error)}</pre>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
 }
 
 function Badge({ category, customCats = [] }) {
@@ -155,12 +182,27 @@ function ListMenu({ entry, lists, onAdd, onRemove, onClose }) {
 
 // ─── entry card ───────────────────────────────────────────────────────────────
 
-function EntryCard({ entry, onToggleRead, onDelete, onTagClick, lists, onAddToList, onRemoveFromList, onUpdate, selected, onSelect, customCats = [] }) {
+function EntryCard({ entry, onToggleRead, onDelete, onTagClick, lists, onAddToList, onRemoveFromList, onUpdate, selected, onSelect, customCats = [], allTags = [] }) {
   const [deleting, setDeleting]       = useState(false);
   const [toggling, setToggling]       = useState(false);
   const [showLists, setShowLists]     = useState(false);
   const [showCatPick, setShowCatPick] = useState(false);
+  const [tags, setTags]               = useState(entry.tags || []);
+  const [tagInput, setTagInput]       = useState("");
   const catBtnRef = useRef(null);
+
+  const tagSuggestions = useMemo(() => {
+    const q = tagInput.trim().toLowerCase();
+    if (!q) return [];
+    return (allTags || [])
+      .map(t => t.tag)
+      .filter(t => t.toLowerCase().includes(q) && !(tags || []).includes(t))
+      .slice(0, 6);
+  }, [tagInput, allTags, tags]);
+
+  useEffect(() => {
+    setTags(entry.tags || []);
+  }, [entry.tags]);
 
   const host = (() => {
     try { return new URL(entry.url).hostname.replace("www.", ""); }
@@ -194,6 +236,42 @@ function EntryCard({ entry, onToggleRead, onDelete, onTagClick, lists, onAddToLi
     });
     const updated = await res.json();
     onUpdate?.(updated);
+  }
+
+  async function addTag(tag) {
+    const newTag = tag.trim();
+    if (!newTag) return;
+    const nextTags = Array.from(new Set([...(tags || []), newTag]));
+    const res = await fetch(`${API}/entries/${entry.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tags: nextTags }),
+    });
+    if (res.ok) {
+      const updated = await res.json();
+      setTags(updated.tags || []);
+      onUpdate?.(updated);
+    }
+  }
+
+  async function handleAddTag(e) {
+    e.preventDefault();
+    await addTag(tagInput);
+    setTagInput("");
+  }
+
+  async function handleRemoveTag(tag) {
+    const nextTags = (tags || []).filter(t => t !== tag);
+    const res = await fetch(`${API}/entries/${entry.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tags: nextTags }),
+    });
+    if (res.ok) {
+      const updated = await res.json();
+      setTags(updated.tags || []);
+      onUpdate?.(updated);
+    }
   }
 
   return (
@@ -300,17 +378,40 @@ function EntryCard({ entry, onToggleRead, onDelete, onTagClick, lists, onAddToLi
         ))}
       </ul>
       {/* tags */}
-      {entry.tags?.length > 0 && (
-        <div className="flex flex-wrap gap-1 px-5 pt-2 pb-3">
-          {entry.tags.map(tag => (
-            <button key={tag} onClick={() => onTagClick?.(tag)}
-              className="text-xs px-2 py-0.5 rounded border border-border bg-surface-2 text-gray-500
-                         hover:border-accent-blue/50 hover:text-accent-blue transition-colors font-mono">
-              #{tag}
-            </button>
+      <div className="px-5 pt-2 pb-3">
+        <div className="flex flex-wrap gap-1 mb-2">
+          {(tags || []).map(tag => (
+            <span key={tag} className="flex items-center gap-1 px-2 py-0.5 rounded border border-border bg-surface-2 text-xs font-mono">
+              <button type="button" onClick={() => onTagClick?.(tag)}
+                className="text-gray-500 hover:text-accent-blue transition-colors">
+                #{tag}
+              </button>
+              <button type="button" onClick={() => handleRemoveTag(tag)}
+                className="text-gray-600 hover:text-accent-red transition-colors">✕</button>
+            </span>
           ))}
         </div>
-      )}
+        <form onSubmit={handleAddTag} className="flex flex-col gap-2">
+          <div className="flex gap-2">
+            <input value={tagInput} onChange={e => setTagInput(e.target.value)}
+              placeholder="Add tag…"
+              className="flex-1 px-2 py-1 rounded text-xs font-mono bg-surface-2 border border-border text-gray-200" />
+            <button type="submit" className="px-3 py-1 text-xs rounded border border-border text-gray-400 hover:text-gray-200 hover:border-gray-500 transition-colors">
+              + Add
+            </button>
+          </div>
+          {tagSuggestions.length > 0 && (
+            <div className="flex flex-wrap gap-1">
+              {tagSuggestions.map(s => (
+                <button key={s} type="button" onClick={() => { addTag(s); setTagInput(""); }}
+                  className="text-xs px-2 py-0.5 rounded border border-border bg-surface-2 text-gray-500 hover:text-accent-blue transition-colors">
+                  {s}
+                </button>
+              ))}
+            </div>
+          )}
+        </form>
+      </div>
     </div>
   );
 }
@@ -455,11 +556,26 @@ function VideoChildItem({ child, index, onTagClick, onRetried }) {
 
 // ─── playlist card ────────────────────────────────────────────────────────────
 
-function PlaylistCard({ entry, onTagClick, customCats = [], onDelete }) {
+function PlaylistCard({ entry, onTagClick, customCats = [], onDelete, onUpdate, allTags = [] }) {
   const [open, setOpen]               = useState(false);
   const [children, setChildren]       = useState(entry.children || []);
   const [loadingKids, setLoadingKids] = useState(false);
   const [deleting, setDeleting]       = useState(false);
+  const [tags, setTags]               = useState(entry.tags || []);
+  const [tagInput, setTagInput]       = useState("");
+
+  const tagSuggestions = useMemo(() => {
+    const q = tagInput.trim().toLowerCase();
+    if (!q) return [];
+    return (allTags || [])
+      .map(t => t.tag)
+      .filter(t => t.toLowerCase().includes(q) && !(tags || []).includes(t))
+      .slice(0, 6);
+  }, [tagInput, allTags, tags]);
+
+  useEffect(() => {
+    setTags(entry.tags || []);
+  }, [entry.tags]);
 
   const isBlog      = entry.category === "blog";
   const isList      = entry.category === "list" || isBlog;
@@ -490,6 +606,42 @@ function PlaylistCard({ entry, onTagClick, customCats = [], onDelete }) {
     setOpen(o => !o);
   }
 
+  async function addTag(tag) {
+    const newTag = tag.trim();
+    if (!newTag) return;
+    const newTags = Array.from(new Set([...(tags || []), newTag]));
+    const res = await fetch(`${API}/entries/${entry.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tags: newTags }),
+    });
+    if (res.ok) {
+      const updated = await res.json();
+      setTags(updated.tags || []);
+      onUpdate?.(updated);
+    }
+  }
+
+  async function handleAddTag(e) {
+    e.preventDefault();
+    await addTag(tagInput);
+    setTagInput("");
+  }
+
+  async function handleRemoveTag(tag) {
+    const newTags = (tags || []).filter(t => t !== tag);
+    const res = await fetch(`${API}/entries/${entry.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tags: newTags }),
+    });
+    if (res.ok) {
+      const updated = await res.json();
+      setTags(updated.tags || []);
+      onUpdate?.(updated);
+    }
+  }
+
   return (
     <div className="rounded-lg border overflow-hidden" style={{ borderColor }}>
       {/* header */}
@@ -513,14 +665,38 @@ function PlaylistCard({ entry, onTagClick, customCats = [], onDelete }) {
             </li>
           ))}
         </ul>
-        {entry.tags?.length > 0 && (
-          <div className="flex flex-wrap gap-1 mt-2">
-            {entry.tags.map(t => (
-              <button key={t} onClick={() => onTagClick?.(t)}
-                className="text-xs text-gray-600 hover:text-gray-400 transition-colors"># {t}</button>
+        <div className="px-1 mt-2">
+          <div className="flex flex-wrap gap-1 mb-2">
+            {(tags || []).map(t => (
+              <span key={t} className="flex items-center gap-1 px-2 py-0.5 rounded border border-border bg-surface-2 text-xs font-mono">
+                <button type="button" onClick={() => onTagClick?.(t)}
+                  className="text-gray-500 hover:text-accent-blue transition-colors"># {t}</button>
+                <button type="button" onClick={() => handleRemoveTag(t)}
+                  className="text-gray-600 hover:text-accent-red transition-colors">✕</button>
+              </span>
             ))}
           </div>
-        )}
+          <form onSubmit={handleAddTag} className="flex flex-col gap-2">
+            <div className="flex gap-2">
+              <input value={tagInput} onChange={e => setTagInput(e.target.value)}
+                placeholder="Add tag…"
+                className="flex-1 px-2 py-1 rounded text-xs font-mono bg-surface-2 border border-border text-gray-200" />
+              <button type="submit" className="px-3 py-1 text-xs rounded border border-border text-gray-400 hover:text-gray-200 hover:border-gray-500 transition-colors">
+                + Add
+              </button>
+            </div>
+            {tagSuggestions.length > 0 && (
+              <div className="flex flex-wrap gap-1">
+                {tagSuggestions.map(s => (
+                  <button key={s} type="button" onClick={() => { addTag(s); setTagInput(""); }}
+                    className="text-xs px-2 py-0.5 rounded border border-border bg-surface-2 text-gray-500 hover:text-accent-blue transition-colors">
+                    {s}
+                  </button>
+                ))}
+              </div>
+            )}
+          </form>
+        </div>
       </div>
 
       {/* children */}
@@ -547,7 +723,7 @@ function ProgressItem({ item, lists, onAddToList, onRemoveFromList, onUpdate, cu
 
   if (item.status === "ok") {
     const card = ["playlist", "list", "blog"].includes(item.entry?.category)
-      ? <PlaylistCard entry={item.entry} customCats={customCats} />
+      ? <PlaylistCard entry={item.entry} customCats={customCats} onUpdate={onUpdate} />
       : <EntryCard entry={item.entry} onToggleRead={() => {}} onDelete={() => {}}
           lists={lists} onAddToList={onAddToList} onRemoveFromList={onRemoveFromList} onUpdate={onUpdate} customCats={customCats} />;
     return (
@@ -1389,6 +1565,7 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
   function handleUpdate(updated) {
     setEntries(prev => prev.map(e => e.id === updated.id ? { ...e, ...updated } : e));
     onUpdate?.(updated);
+    fetchTags();
   }
 
   async function handleEmbedAll() {
@@ -1720,7 +1897,9 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
                 ? <PlaylistCard key={entry.id} entry={entry}
                     onTagClick={t => setActiveTag(prev => prev === t ? "" : t)}
                     customCats={customCats}
-                    onDelete={id => setEntries(prev => prev.filter(e => e.id !== id))} />
+                    onDelete={id => setEntries(prev => prev.filter(e => e.id !== id))}
+                    onUpdate={handleUpdate}
+                    allTags={allTags} />
                 : <EntryCard key={entry.id} entry={entry}
                     onToggleRead={toggleRead} onDelete={deleteEntry}
                     onTagClick={t => setActiveTag(prev => prev === t ? "" : t)}
@@ -1728,7 +1907,8 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
                     onUpdate={handleUpdate}
                     selected={selectedIds.has(entry.id)}
                     onSelect={toggleSelect}
-                    customCats={customCats} />
+                    customCats={customCats}
+                    allTags={allTags} />
             ))}
           </div>
         )}
@@ -1930,13 +2110,15 @@ export default function App() {
             ))} />
         )}
         {tab === "kb" && (
-          <KnowledgeBaseTab refreshKey={refreshKey}
-            lists={lists} onListsChange={setLists}
-            onAddToList={handleAddToList} onRemoveFromList={handleRemoveFromList}
-            customCats={customCats} onCustomCatsChange={setCustomCats}
-            onUpdate={updated => setProgress(prev => prev.map(p =>
-              p.entry?.id === updated.id ? { ...p, entry: { ...p.entry, ...updated } } : p
-            ))} />
+          <ErrorBoundary>
+            <KnowledgeBaseTab refreshKey={refreshKey}
+              lists={lists} onListsChange={setLists}
+              onAddToList={handleAddToList} onRemoveFromList={handleRemoveFromList}
+              customCats={customCats} onCustomCatsChange={setCustomCats}
+              onUpdate={updated => setProgress(prev => prev.map(p =>
+                p.entry?.id === updated.id ? { ...p, entry: { ...p.entry, ...updated } } : p
+              ))} />
+          </ErrorBoundary>
         )}
         {tab === "rss" && <RssTab />}
         {tab === "graph" && <GraphTab />}

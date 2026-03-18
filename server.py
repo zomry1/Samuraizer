@@ -1315,6 +1315,13 @@ def update_entry(entry_id):
         updates["category"] = cat
     if "useful" in body:
         updates["useful"] = 1 if body["useful"] else 0
+    if "tags" in body:
+        tags = body.get("tags") or []
+        if not isinstance(tags, list):
+            return jsonify({"error": "Tags must be a list"}), 400
+        tags = [str(t).strip() for t in tags if str(t).strip()]
+        tags = sorted(set(tags))
+        updates["tags"] = json.dumps(tags)
     if not updates:
         return jsonify({"error": "Nothing to update"}), 400
     set_clause = ", ".join(f"{k} = ?" for k in updates)
@@ -1787,6 +1794,8 @@ def poll_rss_feed(feed_id):
 # ---------------------------------------------------------------------------
 # Boot
 # ---------------------------------------------------------------------------
+# Ensure database exists and is migrated to the latest schema before serving
 init_db()
+
 _start_rss_scheduler()
 app.run(port=8000, debug=True, use_reloader=True)
