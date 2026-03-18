@@ -1,0 +1,12 @@
+{
+  "version": "1.0.0",
+  "scripts": {
+    "start-server": "python server.py",
+    "start-telegram": "python telegram_bot.py",
+    "start-frontend": "cd frontend && npm run dev",
+    "start-all": "concurrently \"python server.py\" \"python telegram_bot.py\" \"cd frontend && npm run dev\""
+  },
+  "devDependencies": {
+    "concurrently": "^8.0.1"
+  }
+}

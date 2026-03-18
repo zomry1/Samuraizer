@@ -1,0 +1,14 @@
+flask
+flask-cors
+trafilatura
+lxml_html_clean
+requests
+google-genai
+python-dotenv
+python-telegram-bot[job-queue]>=21.0
+youtube-transcript-api
+pytubefix
+scrapling
+curl-cffi
+playwright
+browserforge
