@@ -498,7 +498,43 @@ function LogLines({ logs }) {
 function VideoChildItem({ child, index, onTagClick, onRetried }) {
   const [retrying, setRetrying] = useState(false);
   const [error, setError]       = useState("");
+  const [tags, setTags]         = useState(child.tags || []);
+  const [tagInput, setTagInput] = useState("");
   const failed = child.tags?.includes("summary-failed");
+
+  useEffect(() => {
+    setTags(child.tags || []);
+  }, [child.tags]);
+
+  async function addTag(tag) {
+    const newTag = tag.trim();
+    if (!newTag) return;
+    const newTags = Array.from(new Set([...(tags || []), newTag]));
+    const res = await fetch(`${API}/entries/${child.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tags: newTags }),
+    });
+    if (res.ok) {
+      const updated = await res.json();
+      setTags(updated.tags || []);
+      onRetried?.(updated);
+    }
+  }
+
+  async function removeTag(tag) {
+    const newTags = (tags || []).filter(t => t !== tag);
+    const res = await fetch(`${API}/entries/${child.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tags: newTags }),
+    });
+    if (res.ok) {
+      const updated = await res.json();
+      setTags(updated.tags || []);
+      onRetried?.(updated);
+    }
+  }
 
   async function handleRetry() {
     setRetrying(true);
@@ -540,14 +576,27 @@ function VideoChildItem({ child, index, onTagClick, onRetried }) {
               </li>
             ))}
           </ul>
-          {child.tags?.length > 0 && (
-            <div className="flex flex-wrap gap-1 mt-1.5 ml-4">
-              {child.tags.map(t => (
-                <button key={t} onClick={() => onTagClick?.(t)}
-                  className="text-xs text-gray-700 hover:text-gray-500 transition-colors"># {t}</button>
+          <div className="ml-4 mt-2">
+            <div className="flex flex-wrap gap-1 mb-2">
+              {(tags || []).map(t => (
+                <span key={t} className="flex items-center gap-1 px-2 py-0.5 rounded border border-border bg-surface-2 text-xs font-mono">
+                  <button type="button" onClick={() => onTagClick?.(t)}
+                    className="text-gray-500 hover:text-accent-blue transition-colors"># {t}</button>
+                  <button type="button" onClick={() => removeTag(t)}
+                    className="text-gray-600 hover:text-accent-red transition-colors">✕</button>
+                </span>
               ))}
             </div>
-          )}
+            <form onSubmit={e => { e.preventDefault(); addTag(tagInput); setTagInput(""); }}
+              className="flex gap-2">
+              <input value={tagInput} onChange={e => setTagInput(e.target.value)}
+                placeholder="Add tag…"
+                className="flex-1 px-2 py-1 rounded text-xs font-mono bg-surface-2 border border-border text-gray-200" />
+              <button type="submit" className="px-3 py-1 text-xs rounded border border-border text-gray-400 hover:text-gray-200 hover:border-gray-500 transition-colors">
+                + Add
+              </button>
+            </form>
+          </div>
         </>
       )}
     </div>
