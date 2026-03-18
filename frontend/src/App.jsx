@@ -653,6 +653,7 @@ function GraphTab() {
   const [tooltip, setTooltip]  = useState(null);
   const [selected, setSelected] = useState(null); // entry object for info panel
   const [nodeCount, setNodeCount] = useState({ entries: 0, tags: 0 });
+  const [tagSearch, setTagSearch] = useState("");
 
   useEffect(() => {
     fetch(`${API}/entries`)
@@ -671,8 +672,15 @@ function GraphTab() {
     canvas.width  = W;
     canvas.height = H;
 
+    // Filter entries/tags by tagSearch
+    let filteredEntries = entries;
+    if (tagSearch.trim()) {
+      const tag = tagSearch.trim().toLowerCase();
+      filteredEntries = entries.filter(e => e.tags?.some(t => t.toLowerCase().includes(tag)));
+    }
+
     // Build nodes
-    const entryNodes = entries.map(e => ({
+    const entryNodes = filteredEntries.map(e => ({
       id:    `e-${e.id}`,
       kind:  "entry",
       entry: e,
@@ -682,7 +690,7 @@ function GraphTab() {
     }));
 
     const tagCount = {};
-    entries.forEach(e => e.tags?.forEach(t => { tagCount[t] = (tagCount[t] || 0) + 1; }));
+    filteredEntries.forEach(e => e.tags?.forEach(t => { tagCount[t] = (tagCount[t] || 0) + 1; }));
 
     const tagNodes = Object.keys(tagCount).map(t => ({
       id:    `t-${t}`,
@@ -698,7 +706,7 @@ function GraphTab() {
 
     const nodes = [...entryNodes, ...tagNodes];
     const links = [];
-    entries.forEach(e => {
+    filteredEntries.forEach(e => {
       e.tags?.forEach(t => {
         if (tagCount[t]) links.push({ source: `e-${e.id}`, target: `t-${t}` });
       });
@@ -895,7 +903,7 @@ function GraphTab() {
       sim.stop();
       d3.select(canvas).on(".zoom", null);
     };
-  }, [entries]);
+  }, [entries, tagSearch]);
 
   return (
     <div className="relative w-full" style={{ height: "calc(100vh - 120px)" }}>
@@ -915,6 +923,14 @@ function GraphTab() {
             <span className="w-2.5 h-2.5 rounded border border-border inline-block bg-surface-2 flex-shrink-0" />
             tag
           </span>
+          <input
+            type="text"
+            className="ml-4 px-2 py-0.5 rounded border border-border bg-surface-2 text-xs text-gray-500 font-mono"
+            placeholder="Search tag..."
+            value={tagSearch}
+            onChange={e => setTagSearch(e.target.value)}
+            style={{ minWidth: 90 }}
+          />
         </div>
       </div>
 
