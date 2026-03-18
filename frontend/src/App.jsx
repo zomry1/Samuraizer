@@ -1777,17 +1777,17 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
         )}
 
         {/* search + semantic toggle */}
-        <div className="flex flex-col sm:flex-row gap-3 mb-3">
-          <div className={`flex items-center gap-2 bg-surface-1 border rounded px-3 py-2 flex-1 transition-colors
-            ${semanticMode ? "border-accent-purple/50 focus-within:border-accent-purple/70" : "border-border focus-within:border-accent-green/50"}`}>
-            <span className="text-gray-700 text-xs">{semanticMode ? "✦" : "⌕"}</span>
-            <input value={search} onChange={e => setSearch(e.target.value)}
-              placeholder={semanticMode ? "Describe what you're looking for…" : "Search names, bullets, tags…"}
-              className="flex-1 bg-transparent text-sm text-gray-200 placeholder-gray-700 outline-none font-mono" />
-            {(loading || semanticLoading) && <Spinner sm />}
-            {search && <button onClick={() => setSearch("")} className="text-gray-600 hover:text-gray-400 text-xs">✕</button>}
-          </div>
-          <div className="flex items-center gap-1 flex-wrap">
+        <div className="flex flex-col gap-3 mb-3">
+          <div className="flex flex-col sm:flex-row gap-3">
+            <div className={`flex items-center gap-2 bg-surface-1 border rounded px-3 py-2 flex-1 transition-colors
+              ${semanticMode ? "border-accent-purple/50 focus-within:border-accent-purple/70" : "border-border focus-within:border-accent-green/50"}`}>
+              <span className="text-gray-700 text-xs">{semanticMode ? "✦" : "⌕"}</span>
+              <input value={search} onChange={e => setSearch(e.target.value)}
+                placeholder={semanticMode ? "Describe what you're looking for…" : "Search names, bullets, tags…"}
+                className="flex-1 bg-transparent text-sm text-gray-200 placeholder-gray-700 outline-none font-mono" />
+              {(loading || semanticLoading) && <Spinner sm />}
+              {search && <button onClick={() => setSearch("")} className="text-gray-600 hover:text-gray-400 text-xs">✕</button>}
+            </div>
             <button onClick={() => { setSemanticMode(s => !s); setEntries([]); }}
               title="Toggle semantic / embedding-based search"
               className={`px-3 py-1.5 rounded text-xs font-bold border transition-colors flex items-center gap-1.5
@@ -1796,10 +1796,14 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
                   : "text-gray-600 border-border hover:text-gray-400 hover:border-gray-600"}`}>
               ✦ Semantic
             </button>
-            {/* source filter */}
-            {!semanticMode && (
+          </div>
+
+          {/* source + category filters */}
+          <div className="flex flex-col sm:flex-row gap-3">
+            <div className="flex flex-col sm:flex-row items-center gap-2">
+              <span className="text-xs font-semibold text-gray-400">Source:</span>
               <div className="flex items-center border border-border rounded overflow-hidden">
-                {[["all", "All"], ["manual", "Manual"], ["rss", "RSS"]].map(([val, label]) => (
+                {[ ["all", "All"], ["manual", "Manual"], ["rss", "RSS"] ].map(([val, label]) => (
                   <button key={val} onClick={() => setSourceFilter(val)}
                     className={`px-2.5 py-1.5 text-xs font-bold transition-colors
                       ${sourceFilter === val
@@ -1809,45 +1813,58 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
                   </button>
                 ))}
               </div>
-            )}
-            {!semanticMode && CATEGORIES.map(cat => {
-              const active = category === cat;
-              const meta   = CAT_META[cat];
-              const count  = cat === "all" ? entries.length : (catCounts[cat] || 0);
-              return (
-                <button key={cat} onClick={() => setCategory(cat)}
-                  className={`px-3 py-1.5 rounded text-xs font-bold uppercase tracking-wider border transition-colors
-                    ${active ? (meta ? meta.color : "text-gray-200 border-gray-500 bg-surface-2") : "text-gray-600 border-border hover:border-gray-500 hover:text-gray-400"}`}>
-                  {cat === "all" ? "All" : meta?.label}{count > 0 ? ` ${count}` : ""}
-                </button>
-              );
-            })}
-            {!semanticMode && customCats.map(c => {
-              const active = category === c.slug;
-              const count  = catCounts[c.slug] || 0;
-              return (
-                <button key={c.slug} onClick={() => setCategory(c.slug)}
-                  style={active ? { color: c.color, borderColor: c.color + "66", backgroundColor: c.color + "1a" } : {}}
-                  className={`px-3 py-1.5 rounded text-xs font-bold uppercase tracking-wider border transition-colors
-                    ${active ? "" : "text-gray-600 border-border hover:border-gray-500 hover:text-gray-400"}`}>
-                  {c.label}{count > 0 ? ` ${count}` : ""}
-                </button>
-              );
-            })}
-            {!semanticMode && (
+            </div>
+
+            <div className="flex-1 flex flex-wrap gap-2 items-center">
+              <span className="text-xs font-semibold text-gray-400">Category:</span>
+              <div className="flex flex-wrap gap-1">
+                {CATEGORIES.map(cat => {
+                  const active = category === cat;
+                  const meta   = CAT_META[cat];
+                  const count  = cat === "all" ? entries.length : (catCounts[cat] || 0);
+                  return (
+                    <button key={cat} onClick={() => setCategory(cat)}
+                      className={`px-3 py-1.5 rounded text-xs font-bold uppercase tracking-wider border transition-colors
+                        ${active ? (meta ? meta.color : "text-gray-200 border-gray-500 bg-surface-2") : "text-gray-600 border-border hover:border-gray-500 hover:text-gray-400"}`}>
+                      {cat === "all" ? "All" : meta?.label}{count > 0 ? ` ${count}` : ""}
+                    </button>
+                  );
+                })}
+                {customCats.map(c => {
+                  const active = category === c.slug;
+                  const count  = catCounts[c.slug] || 0;
+                  return (
+                    <button key={c.slug} onClick={() => setCategory(c.slug)}
+                      style={active ? { color: c.color, borderColor: c.color + "66", backgroundColor: c.color + "1a" } : {}}
+                      className={`px-3 py-1.5 rounded text-xs font-bold uppercase tracking-wider border transition-colors
+                        ${active ? "" : "text-gray-600 border-border hover:border-gray-500 hover:text-gray-400"}`}>
+                      {c.label}{count > 0 ? ` ${count}` : ""}
+                    </button>
+                  );
+                })}
+              </div>
               <button onClick={() => setShowCatManager(s => !s)}
                 title="Manage custom categories"
                 className={`px-2 py-1.5 rounded text-xs border transition-colors
                   ${showCatManager ? "text-gray-300 border-gray-500 bg-surface-2" : "text-gray-600 border-border hover:border-gray-500 hover:text-gray-400"}`}>
                 ⊕
               </button>
-            )}
+            </div>
           </div>
         </div>
 
         {/* custom category manager */}
         {showCatManager && (
           <div className="mb-3 p-3 rounded border border-border bg-surface-1 space-y-3">
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="text-xs font-bold text-gray-200">Custom categories</div>
+                <div className="text-xs text-gray-500">Create your own category tags to group entries.</div>
+              </div>
+              <button onClick={() => setShowCatManager(false)}
+                className="text-xs text-gray-500 hover:text-gray-300">Close</button>
+            </div>
+
             {customCats.length > 0 && (
               <div className="flex flex-wrap gap-2">
                 {customCats.map(c => (
@@ -1860,20 +1877,24 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
                 ))}
               </div>
             )}
-            <form onSubmit={handleAddCat} className="flex items-center gap-2 flex-wrap">
+
+            <form onSubmit={handleAddCat} className="flex flex-col sm:flex-row items-center gap-2">
               <input value={newCatLabel} onChange={e => setNewCatLabel(e.target.value)}
-                placeholder="Category name…"
-                className="bg-surface-2 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-700 outline-none focus:border-gray-500 w-36" />
-              <div className="flex gap-1">
-                {CAT_PALETTE.filter(col => !customCats.some(c => c.color === col)).map(col => (
-                  <button type="button" key={col} onClick={() => setNewCatColor(col)}
-                    style={{ backgroundColor: col, outline: newCatColor === col ? `2px solid ${col}` : "none", outlineOffset: "2px" }}
-                    className="w-4 h-4 rounded-full transition-transform hover:scale-110" />
-                ))}
+                placeholder="New category name…"
+                className="flex-1 bg-surface-2 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-700 outline-none focus:border-gray-500" />
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-gray-500">Color:</span>
+                <div className="flex gap-1">
+                  {CAT_PALETTE.filter(col => !customCats.some(c => c.color === col)).map(col => (
+                    <button type="button" key={col} onClick={() => setNewCatColor(col)}
+                      style={{ backgroundColor: col, outline: newCatColor === col ? `2px solid ${col}` : "none", outlineOffset: "2px" }}
+                      className="w-4 h-4 rounded-full transition-transform hover:scale-110" />
+                  ))}
+                </div>
               </div>
               <button type="submit"
-                className="px-2 py-1 rounded text-xs border border-border text-gray-400 hover:text-gray-200 hover:border-gray-500 transition-colors">
-                + Add
+                className="px-3 py-1 rounded text-xs border border-border text-gray-400 hover:text-gray-200 hover:border-gray-500 transition-colors">
+                + Add category
               </button>
             </form>
           </div>
