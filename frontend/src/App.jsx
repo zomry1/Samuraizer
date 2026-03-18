@@ -234,6 +234,9 @@ function EntryCard({ entry, onToggleRead, onDelete, onTagClick, lists, onAddToLi
             )}
           </div>
           {entry.name && <span className="text-sm font-semibold text-gray-200 truncate">{entry.name}</span>}
+          {entry.source === "rss" && (
+            <span className="flex-shrink-0 px-1.5 py-0.5 rounded border border-orange-400/40 bg-orange-400/10 text-orange-400 text-xs font-bold uppercase tracking-wider">RSS</span>
+          )}
           <a href={entry.url} target="_blank" rel="noreferrer"
             className="text-xs text-gray-600 hover:text-accent-blue truncate transition-colors font-mono hidden sm:block"
             title={entry.url}>{host}</a>
@@ -637,6 +640,131 @@ function SuggestCard({ onTagClick, lists, onAddToList, onRemoveFromList, onUpdat
           <p className="text-xs text-gray-600 font-mono leading-relaxed border-l-2 border-border pl-3 mt-2">
             {entry.preview}…
           </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── RSS tab ──────────────────────────────────────────────────────────────────
+
+function RssTab() {
+  const [feeds, setFeeds]       = useState([]);
+  const [loading, setLoading]   = useState(true);
+  const [url, setUrl]           = useState("");
+  const [name, setName]         = useState("");
+  const [adding, setAdding]     = useState(false);
+  const [error, setError]       = useState("");
+  const [polling, setPolling]   = useState({}); // { feedId: true }
+  const [pollResult, setPollResult] = useState({}); // { feedId: N }
+
+  async function fetchFeeds() {
+    try {
+      const data = await (await fetch(`${API}/rss-feeds`)).json();
+      setFeeds(Array.isArray(data) ? data : []);
+    } catch (e) { console.error(e); }
+    finally { setLoading(false); }
+  }
+
+  useEffect(() => { fetchFeeds(); }, []);
+
+  async function handleAdd(e) {
+    e.preventDefault();
+    setError("");
+    if (!url.trim()) return;
+    setAdding(true);
+    try {
+      const res  = await fetch(`${API}/rss-feeds`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: url.trim(), name: name.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok) { setError(data.error || "Failed to add feed"); return; }
+      setFeeds(prev => [data, ...prev]);
+      setUrl(""); setName("");
+    } catch (e) { setError("Network error"); }
+    finally { setAdding(false); }
+  }
+
+  async function handleDelete(id) {
+    await fetch(`${API}/rss-feeds/${id}`, { method: "DELETE" });
+    setFeeds(prev => prev.filter(f => f.id !== id));
+  }
+
+  async function handlePoll(id) {
+    setPolling(prev => ({ ...prev, [id]: true }));
+    setPollResult(prev => ({ ...prev, [id]: null }));
+    try {
+      const res  = await fetch(`${API}/rss-feeds/${id}/poll`, { method: "POST" });
+      const data = await res.json();
+      setPollResult(prev => ({ ...prev, [id]: data.added }));
+      fetchFeeds();
+    } catch (e) { setPollResult(prev => ({ ...prev, [id]: -1 })); }
+    finally { setPolling(prev => ({ ...prev, [id]: false })); }
+  }
+
+  return (
+    <div className="max-w-2xl space-y-6">
+      <div>
+        <h2 className="text-sm font-bold text-gray-300 uppercase tracking-widest mb-1">RSS Feeds</h2>
+        <p className="text-xs text-gray-600">Add RSS/Atom feeds — the server checks for new posts every hour and adds them to the Knowledge Base automatically. RSS entries are KB-only and won't appear in Suggested Read.</p>
+      </div>
+
+      {/* Add feed form */}
+      <form onSubmit={handleAdd} className="flex flex-col gap-2">
+        <div className="flex gap-2">
+          <input value={url} onChange={e => setUrl(e.target.value)}
+            placeholder="Feed URL (https://...)"
+            className="flex-1 bg-surface-1 border border-border rounded px-3 py-2 text-xs text-gray-200 placeholder-gray-700 font-mono outline-none focus:border-accent-green/50" />
+          <input value={name} onChange={e => setName(e.target.value)}
+            placeholder="Name (optional)"
+            className="w-40 bg-surface-1 border border-border rounded px-3 py-2 text-xs text-gray-200 placeholder-gray-700 font-mono outline-none focus:border-accent-green/50" />
+          <button type="submit" disabled={adding || !url.trim()}
+            className="px-4 py-2 rounded border border-accent-green/40 text-accent-green text-xs font-bold hover:bg-accent-green/10 transition-colors disabled:opacity-40">
+            {adding ? <Spinner sm /> : "+ Add"}
+          </button>
+        </div>
+        {error && <p className="text-xs text-accent-red">{error}</p>}
+      </form>
+
+      {/* Feed list */}
+      {loading ? (
+        <div className="flex items-center gap-2 text-sm text-gray-700"><Spinner /><span>Loading…</span></div>
+      ) : feeds.length === 0 ? (
+        <div className="text-xs text-gray-700 mt-4">No feeds yet. Add one above.</div>
+      ) : (
+        <div className="space-y-2">
+          {feeds.map(feed => (
+            <div key={feed.id} className="flex items-center justify-between gap-3 px-4 py-3 rounded border border-border bg-surface-1">
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-semibold text-gray-200 truncate">{feed.name || feed.url}</span>
+                  <span className="flex-shrink-0 px-1.5 py-0.5 rounded border border-orange-400/40 bg-orange-400/10 text-orange-400 text-xs font-bold">RSS</span>
+                </div>
+                {feed.name && <p className="text-xs text-gray-600 font-mono truncate mt-0.5">{feed.url}</p>}
+                <p className="text-xs text-gray-700 mt-0.5">
+                  {feed.last_checked
+                    ? `Last checked: ${new Date(feed.last_checked).toLocaleString()}`
+                    : "Not yet checked"}
+                  {" · "}{feed.entry_count ?? 0} RSS entries in KB
+                </p>
+              </div>
+              <div className="flex items-center gap-2 flex-shrink-0">
+                {pollResult[feed.id] != null && (
+                  <span className={`text-xs ${pollResult[feed.id] < 0 ? "text-accent-red" : "text-accent-green"}`}>
+                    {pollResult[feed.id] < 0 ? "Error" : `+${pollResult[feed.id]} new`}
+                  </span>
+                )}
+                <button onClick={() => handlePoll(feed.id)} disabled={polling[feed.id]}
+                  className="px-2 py-1 rounded border border-border text-xs text-gray-500 hover:text-accent-blue hover:border-accent-blue/40 transition-colors disabled:opacity-40 flex items-center gap-1">
+                  {polling[feed.id] ? <><Spinner sm />Polling…</> : "↻ Poll now"}
+                </button>
+                <button onClick={() => handleDelete(feed.id)}
+                  className="text-xs text-gray-700 hover:text-accent-red transition-colors">✕</button>
+              </div>
+            </div>
+          ))}
         </div>
       )}
     </div>
@@ -1184,6 +1312,7 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
   const [showCatManager, setShowCatManager] = useState(false);
   const [newCatLabel, setNewCatLabel]       = useState("");
   const [newCatColor, setNewCatColor]       = useState("#58a6ff");
+  const [sourceFilter, setSourceFilter]     = useState("all"); // "all" | "manual" | "rss"
 
   const CAT_PALETTE = ["#3fb950","#58a6ff","#22d3ee","#fb923c","#bc8cff","#f85149","#d29922","#fb7185","#34d399","#f97316","#a78bfa","#94a3b8"];
 
@@ -1213,6 +1342,7 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
       if (category !== "all") p.set("category", category);
       if (debouncedSearch)    p.set("search", debouncedSearch);
       if (activeTag)          p.set("tag", activeTag);
+      if (sourceFilter !== "all") p.set("source", sourceFilter);
       const smart = SMART_LISTS.find(s => s.id === activeList);
       if (smart) {
         Object.entries(smart.param).forEach(([k, v]) => p.set(k, v));
@@ -1223,7 +1353,7 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
       setEntries(await res.json());
     } catch (e) { console.error(e); }
     finally { setLoading(false); }
-  }, [semanticMode, category, debouncedSearch, activeTag, activeList, refreshKey]);
+  }, [semanticMode, category, debouncedSearch, activeTag, activeList, sourceFilter, refreshKey]);
 
   // Semantic search effect
   useEffect(() => {
@@ -1440,6 +1570,20 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
                   : "text-gray-600 border-border hover:text-gray-400 hover:border-gray-600"}`}>
               ✦ Semantic
             </button>
+            {/* source filter */}
+            {!semanticMode && (
+              <div className="flex items-center border border-border rounded overflow-hidden">
+                {[["all", "All"], ["manual", "Manual"], ["rss", "RSS"]].map(([val, label]) => (
+                  <button key={val} onClick={() => setSourceFilter(val)}
+                    className={`px-2.5 py-1.5 text-xs font-bold transition-colors
+                      ${sourceFilter === val
+                        ? "bg-surface-2 text-gray-200 border-r border-border last:border-r-0"
+                        : "text-gray-600 hover:text-gray-400 border-r border-border last:border-r-0"}`}>
+                    {label}
+                  </button>
+                ))}
+              </div>
+            )}
             {!semanticMode && CATEGORIES.map(cat => {
               const active = category === cat;
               const meta   = CAT_META[cat];
@@ -1756,6 +1900,7 @@ export default function App() {
             {[
               { id: "analyze", label: "Analyze" },
               { id: "kb",      label: "Knowledge Base" },
+              { id: "rss",     label: "RSS" },
               { id: "graph",   label: "Graph" },
             ].map(({ id, label }) => (
               <button key={id} onClick={() => setTab(id)}
@@ -1793,6 +1938,7 @@ export default function App() {
               p.entry?.id === updated.id ? { ...p, entry: { ...p.entry, ...updated } } : p
             ))} />
         )}
+        {tab === "rss" && <RssTab />}
         {tab === "graph" && <GraphTab />}
       </main>
     </div>

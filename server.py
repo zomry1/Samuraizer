@@ -10,8 +10,10 @@ import math
 import time
 import sqlite3
 import logging
+import threading
 import requests
 import trafilatura
+import feedparser
 from urllib.parse import urlparse, urljoin
 from scrapling import Fetcher as ScraplingFetcher
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
@@ -108,6 +110,18 @@ def init_db():
             db.execute("ALTER TABLE entries ADD COLUMN useful INTEGER DEFAULT 0")
         if "parent_id" not in cols:
             db.execute("ALTER TABLE entries ADD COLUMN parent_id INTEGER DEFAULT NULL")
+        if "source" not in cols:
+            db.execute("ALTER TABLE entries ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")
+        # RSS feeds table
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS rss_feeds (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                url           TEXT    UNIQUE NOT NULL,
+                name          TEXT    NOT NULL DEFAULT '',
+                last_checked  TEXT    DEFAULT NULL,
+                created_at    TEXT    DEFAULT (datetime('now'))
+            )
+        """)
         db.commit()
 
 
@@ -944,7 +958,7 @@ def _process_blog_listing(url: str, selected_urls: list | None = None, listing_t
 # ---------------------------------------------------------------------------
 # Core: process one URL — generator, owns its own DB connection
 # ---------------------------------------------------------------------------
-def _process_url(url: str):
+def _process_url(url: str, source: str = "manual"):
     # Playlists have their own full pipeline (cache + fetch + summarise)
     if _extract_playlist_id(url):
         yield from _process_playlist(url)
@@ -1002,9 +1016,9 @@ def _process_url(url: str):
             return
 
         cur = db.execute(
-            "INSERT INTO entries (url, name, bullets, category, tags, content) VALUES (?,?,?,?,?,?)",
+            "INSERT INTO entries (url, name, bullets, category, tags, content, source) VALUES (?,?,?,?,?,?,?)",
             (url, result["name"], json.dumps(result["bullets"]),
-             result["category"], json.dumps(result["tags"]), content),
+             result["category"], json.dumps(result["tags"]), content, source),
         )
         db.commit()
         yield log("Saved to knowledge base")
@@ -1050,6 +1064,7 @@ def _row_to_dict(row, db=None) -> dict:
         "read":        bool(row["read"]),
         "useful":      bool(row["useful"]),
         "parent_id":   row["parent_id"] if "parent_id" in row.keys() else None,
+        "source":      row["source"] if "source" in row.keys() else "manual",
         "created_at":  row["created_at"],
     }
 
@@ -1197,9 +1212,14 @@ def list_entries():
     list_id     = request.args.get("list_id",  "").strip()
     read_filter = request.args.get("read",     "").strip()
     useful_only = request.args.get("useful",   "").strip()
+    source_filter = request.args.get("source", "").strip().lower()
 
     db = get_db()
     query, params = "SELECT * FROM entries WHERE parent_id IS NULL", []
+
+    if source_filter in ("manual", "rss"):
+        query += " AND source = ?"
+        params.append(source_filter)
 
     if category and category != "all":
         query += " AND category = ?"
@@ -1362,7 +1382,7 @@ def suggest():
     """Return one random unread entry. Returns null if all read."""
     exclude = request.args.get("exclude", "")
     db  = get_db()
-    q   = "SELECT * FROM entries WHERE read = 0"
+    q   = "SELECT * FROM entries WHERE read = 0 AND source = 'manual'"
     params: list = []
     if exclude:
         q += " AND id != ?"
@@ -1576,6 +1596,151 @@ def delete_category(slug):
 
 
 # ---------------------------------------------------------------------------
+# RSS Feed Polling
+# ---------------------------------------------------------------------------
+
+def _poll_rss_feed(db, feed_id: int, feed_url: str) -> int:
+    """Fetch and parse one RSS/Atom feed; analyse new entries. Returns count added."""
+    try:
+        parsed = feedparser.parse(feed_url)
+    except Exception as exc:
+        logger.warning("RSS fetch failed for %s: %s", feed_url, exc)
+        return 0
+
+    added = 0
+    for item in parsed.entries:
+        url = item.get("link", "").strip()
+        if not url or not url.startswith(("http://", "https://")):
+            continue
+        existing = db.execute("SELECT id FROM entries WHERE url = ?", (url,)).fetchone()
+        if existing:
+            continue
+        try:
+            for event in _process_url(url, source="rss"):
+                if event.get("type") == "error":
+                    logger.warning("RSS analysis error for %s: %s", url, event.get("msg"))
+        except Exception as exc:
+            logger.warning("RSS item skipped (%s): %s", url, exc)
+            continue
+        added += 1
+
+    db.execute(
+        "UPDATE rss_feeds SET last_checked = datetime('now') WHERE id = ?",
+        (feed_id,),
+    )
+    db.commit()
+    logger.info("RSS feed %s polled: %d new entries", feed_url, added)
+    return added
+
+
+def _poll_all_feeds():
+    """Poll all registered RSS feeds. Called by the background scheduler."""
+    db = sqlite3.connect(DB_PATH)
+    db.row_factory = sqlite3.Row
+    try:
+        feeds = db.execute("SELECT id, url FROM rss_feeds").fetchall()
+        for feed in feeds:
+            _poll_rss_feed(db, feed["id"], feed["url"])
+    except Exception as exc:
+        logger.error("RSS poll error: %s", exc)
+    finally:
+        db.close()
+
+
+def _start_rss_scheduler():
+    """Start a recurring background timer that polls all RSS feeds every hour."""
+    def _run():
+        _poll_all_feeds()
+        t = threading.Timer(3600, _run)
+        t.daemon = True
+        t.start()
+
+    initial = threading.Timer(60, _run)
+    initial.daemon = True
+    initial.start()
+    logger.info("RSS scheduler started (first poll in 60s, then every 3600s)")
+
+
+# ---------------------------------------------------------------------------
+# RSS Feed API routes
+# ---------------------------------------------------------------------------
+
+@app.route("/rss-feeds", methods=["GET"])
+def list_rss_feeds():
+    db   = get_db()
+    rows = db.execute("""
+        SELECT f.id, f.url, f.name, f.last_checked, f.created_at,
+               COUNT(e.id) AS entry_count
+        FROM rss_feeds f
+        LEFT JOIN entries e ON e.source = 'rss'
+            AND e.url IN (SELECT url FROM entries WHERE source='rss')
+        GROUP BY f.id
+        ORDER BY f.created_at DESC
+    """).fetchall()
+    # Use a simpler query that counts entries where feed url is matched by domain heuristic
+    # Actually just return feed metadata + a total RSS entry count per feed stored in a separate way
+    # Simplest: return feeds, entry_count = total rss entries (not per-feed)
+    feeds = []
+    for r in db.execute("SELECT id, url, name, last_checked, created_at FROM rss_feeds ORDER BY created_at DESC").fetchall():
+        count = db.execute(
+            "SELECT COUNT(*) FROM entries WHERE source = 'rss'"
+        ).fetchone()[0]
+        feeds.append({
+            "id":           r["id"],
+            "url":          r["url"],
+            "name":         r["name"],
+            "last_checked": r["last_checked"],
+            "created_at":   r["created_at"],
+            "entry_count":  count,
+        })
+    return jsonify(feeds), 200
+
+
+@app.route("/rss-feeds", methods=["POST"])
+def add_rss_feed():
+    body = request.get_json(silent=True) or {}
+    url  = str(body.get("url", "")).strip()
+    name = str(body.get("name", "")).strip()
+    if not url.startswith(("http://", "https://")):
+        return jsonify({"error": "URL must start with http:// or https://"}), 400
+    db = get_db()
+    try:
+        row = db.execute(
+            "INSERT INTO rss_feeds (url, name) VALUES (?, ?) RETURNING id, url, name, last_checked, created_at",
+            (url, name),
+        ).fetchone()
+        db.commit()
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "Feed URL already exists"}), 409
+    return jsonify(dict(row)), 201
+
+
+@app.route("/rss-feeds/<int:feed_id>", methods=["DELETE"])
+def delete_rss_feed(feed_id):
+    db = get_db()
+    db.execute("DELETE FROM rss_feeds WHERE id = ?", (feed_id,))
+    db.commit()
+    return "", 204
+
+
+@app.route("/rss-feeds/<int:feed_id>/poll", methods=["POST"])
+def poll_rss_feed(feed_id):
+    db  = get_db()
+    row = db.execute("SELECT id, url FROM rss_feeds WHERE id = ?", (feed_id,)).fetchone()
+    if not row:
+        return jsonify({"error": "Feed not found"}), 404
+    # Use a fresh connection so _poll_rss_feed can commit independently
+    poll_db = sqlite3.connect(DB_PATH)
+    poll_db.row_factory = sqlite3.Row
+    try:
+        added = _poll_rss_feed(poll_db, row["id"], row["url"])
+    finally:
+        poll_db.close()
+    return jsonify({"added": added}), 200
+
+
+# ---------------------------------------------------------------------------
 # Boot
 # ---------------------------------------------------------------------------
+_start_rss_scheduler()
 app.run(port=8000, debug=True, use_reloader=True)
