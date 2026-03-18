@@ -939,6 +939,13 @@ def _process_blog_listing(url: str, selected_urls: list | None = None, listing_t
             )
             db.commit()
 
+        # Auto-list: find-or-create a list named after the blog and add all children
+        if new_entry_ids:
+            auto_list_name = site_name or listing_title or url
+            auto_list_id = _get_or_create_list(db, auto_list_name)
+            _add_entries_to_list(db, auto_list_id, new_entry_ids)
+            yield log(f"Added {len(new_entry_ids)} articles to list '{auto_list_name}'")
+
         children = [_row_to_dict(r, db) for r in db.execute(
             "SELECT * FROM entries WHERE parent_id = ? ORDER BY id", (listing_id,)
         ).fetchall()] if listing_id else []
@@ -1082,6 +1089,27 @@ def _bulk_list_ids(db, entry_ids: list[int]) -> dict[int, list[int]]:
     for r in rows:
         result[r["entry_id"]].append(r["list_id"])
     return result
+
+
+def _get_or_create_list(db, name: str) -> int:
+    """Return the id of a list with the given name, creating it if needed."""
+    row = db.execute("SELECT id FROM lists WHERE name = ?", (name,)).fetchone()
+    if row:
+        return row["id"]
+    cur = db.execute("INSERT INTO lists (name) VALUES (?)", (name,))
+    db.commit()
+    return cur.lastrowid
+
+
+def _add_entries_to_list(db, list_id: int, entry_ids: list[int]) -> None:
+    """Insert entries into a list, ignoring duplicates."""
+    if not entry_ids:
+        return
+    db.executemany(
+        "INSERT OR IGNORE INTO list_entries (list_id, entry_id) VALUES (?, ?)",
+        [(list_id, eid) for eid in entry_ids],
+    )
+    db.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -1607,29 +1635,46 @@ def _poll_rss_feed(db, feed_id: int, feed_url: str) -> int:
         logger.warning("RSS fetch failed for %s: %s", feed_url, exc)
         return 0
 
+    # Determine the list name from the feed title or its stored name
+    feed_row = db.execute("SELECT name FROM rss_feeds WHERE id = ?", (feed_id,)).fetchone()
+    feed_title = (feed_row["name"] if feed_row and feed_row["name"] else "") or \
+                 getattr(getattr(parsed, "feed", None), "title", "") or feed_url
+    auto_list_id = _get_or_create_list(db, feed_title)
+
     added = 0
+    new_ids = []
     for item in parsed.entries:
         url = item.get("link", "").strip()
         if not url or not url.startswith(("http://", "https://")):
             continue
         existing = db.execute("SELECT id FROM entries WHERE url = ?", (url,)).fetchone()
         if existing:
+            # Still add to list if not already there
+            _add_entries_to_list(db, auto_list_id, [existing["id"]])
             continue
         try:
+            entry_id = None
             for event in _process_url(url, source="rss"):
                 if event.get("type") == "error":
                     logger.warning("RSS analysis error for %s: %s", url, event.get("msg"))
+                elif event.get("type") == "result":
+                    entry_id = event["entry"]["id"]
+            if entry_id:
+                new_ids.append(entry_id)
         except Exception as exc:
             logger.warning("RSS item skipped (%s): %s", url, exc)
             continue
         added += 1
+
+    if new_ids:
+        _add_entries_to_list(db, auto_list_id, new_ids)
 
     db.execute(
         "UPDATE rss_feeds SET last_checked = datetime('now') WHERE id = ?",
         (feed_id,),
     )
     db.commit()
-    logger.info("RSS feed %s polled: %d new entries", feed_url, added)
+    logger.info("RSS feed %s polled: %d new entries added to list '%s'", feed_url, added, feed_title)
     return added
 
 
@@ -1742,5 +1787,6 @@ def poll_rss_feed(feed_id):
 # ---------------------------------------------------------------------------
 # Boot
 # ---------------------------------------------------------------------------
+init_db()
 _start_rss_scheduler()
 app.run(port=8000, debug=True, use_reloader=True)
