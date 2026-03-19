@@ -8,6 +8,7 @@ import re
 import json
 import math
 import time
+import shutil
 import sqlite3
 import logging
 import threading
@@ -41,6 +42,36 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 DB_PATH = os.path.join(os.path.dirname(__file__), "samuraizer.db")
+BACKUP_DIR = os.path.join(os.path.dirname(__file__), "db_backups")
+
+
+def _ensure_backup_dir():
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+
+
+def _make_db_backup(reason: str = "manual"):
+    """Copy the current DB to a timestamped backup file.
+
+    This is run on server startup and periodically (every 12h).
+    """
+    try:
+        _ensure_backup_dir()
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        dest = os.path.join(BACKUP_DIR, f"samuraizer_{ts}.db")
+        shutil.copy2(DB_PATH, dest)
+        logger.info("DB backup saved to %s (%s)", dest, reason)
+    except Exception as exc:
+        logger.error("DB backup failed (%s): %s", reason, exc)
+
+
+def _start_backup_scheduler(interval_hours: int = 12):
+    def loop():
+        while True:
+            time.sleep(interval_hours * 3600)
+            _make_db_backup("interval")
+
+    t = threading.Thread(target=loop, daemon=True)
+    t.start()
 
 # ---------------------------------------------------------------------------
 # Database
@@ -2127,6 +2158,12 @@ def chat():
 # ---------------------------------------------------------------------------
 # Ensure database exists and is migrated to the latest schema before serving
 init_db()
+
+# Backup on startup and every 12 hours (keep all backups)
+# When running with the Flask reloader, only run backups in the reloader child.
+if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+    _make_db_backup("startup")
+    _start_backup_scheduler(12)
 
 _start_rss_scheduler()
 app.run(port=8000, debug=True, use_reloader=True)

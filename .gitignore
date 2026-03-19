@@ -24,3 +24,8 @@ frontend/dist/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local runtime artifacts
+samuraizer.db
+samuraizer.log
+/db_backups/
