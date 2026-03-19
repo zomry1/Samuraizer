@@ -311,7 +311,13 @@ function EntryCard({ entry, onToggleRead, onDelete, onTagClick, lists, onAddToLi
                 onClose={() => setShowCatPick(false)} />
             )}
           </div>
-          {entry.name && <span className="text-sm font-semibold text-gray-200 truncate">{entry.name}</span>}
+          {entry.name && (
+            <a href={entry.url} target="_blank" rel="noreferrer"
+              className="text-sm font-semibold text-gray-200 truncate hover:text-accent-blue transition-colors"
+              title={entry.name}>
+              {entry.name}
+            </a>
+          )}
           {entry.source === "rss" && (
             <span className="flex-shrink-0 px-1.5 py-0.5 rounded border border-orange-400/40 bg-orange-400/10 text-orange-400 text-xs font-bold uppercase tracking-wider">RSS</span>
           )}
