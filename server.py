@@ -1909,7 +1909,7 @@ def list_chat_sessions():
 def create_chat_session():
     body  = request.get_json(silent=True) or {}
     model = (body.get("model") or "gemini-2.5-flash").strip()
-    title = (body.get("title") or "").strip() or None
+    title = (body.get("title") or "").strip() or "Untitled"
     db    = get_db()
     cur   = db.execute(
         "INSERT INTO chat_sessions (title, model) VALUES (?,?)", (title, model)
@@ -2092,7 +2092,7 @@ def chat():
                     "INSERT INTO chat_messages (session_id, role, text, sources) VALUES (?,?,?,?)",
                     (session_id, "assistant", assembled, json.dumps(sources)),
                 )
-                if not session_title:
+                if not session_title or session_title.strip().lower() == "untitled":
                     session_title = question[:60]
                     sdb.execute(
                         "UPDATE chat_sessions SET title = ?, updated_at = datetime('now') WHERE id = ?",
