@@ -1391,6 +1391,11 @@ def update_entry(entry_id):
     custom_slugs = {r["slug"] for r in db.execute("SELECT slug FROM custom_categories").fetchall()}
     valid_cats = _BUILTIN_CATS | custom_slugs
     updates    = {}
+    if "name" in body:
+        name = str(body["name"]).strip()
+        if not name:
+            return jsonify({"error": "Name cannot be empty"}), 400
+        updates["name"] = name
     if "category" in body:
         cat = str(body["category"]).strip().lower()
         if cat not in valid_cats:

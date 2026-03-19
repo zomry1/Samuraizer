@@ -187,9 +187,15 @@ function EntryCard({ entry, onToggleRead, onDelete, onTagClick, lists, onAddToLi
   const [toggling, setToggling]       = useState(false);
   const [showLists, setShowLists]     = useState(false);
   const [showCatPick, setShowCatPick] = useState(false);
+  const [editingName, setEditingName] = useState(false);
+  const [draftName, setDraftName]     = useState(entry.name || "");
   const [tags, setTags]               = useState(entry.tags || []);
   const [tagInput, setTagInput]       = useState("");
   const catBtnRef = useRef(null);
+
+  useEffect(() => {
+    setDraftName(entry.name || "");
+  }, [entry.name]);
 
   const tagSuggestions = useMemo(() => {
     const q = tagInput.trim().toLowerCase();
@@ -252,6 +258,30 @@ function EntryCard({ entry, onToggleRead, onDelete, onTagClick, lists, onAddToLi
       setTags(updated.tags || []);
       onUpdate?.(updated);
     }
+  }
+
+  async function saveName(e) {
+    e?.preventDefault();
+    const nextName = (draftName || "").trim();
+    if (!nextName) {
+      setDraftName(entry.name || "");
+      setEditingName(false);
+      return;
+    }
+    if (nextName === entry.name) {
+      setEditingName(false);
+      return;
+    }
+    const res = await fetch(`${API}/entries/${entry.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: nextName }),
+    });
+    if (res.ok) {
+      const updated = await res.json();
+      onUpdate?.(updated);
+    }
+    setEditingName(false);
   }
 
   async function handleAddTag(e) {
@@ -331,11 +361,31 @@ function EntryCard({ entry, onToggleRead, onDelete, onTagClick, lists, onAddToLi
             )}
           </div>
           {entry.name && (
-            <a href={entry.url} target="_blank" rel="noreferrer"
-              className="text-sm font-semibold text-gray-200 truncate hover:text-accent-blue transition-colors"
-              title={entry.name}>
-              {entry.name}
-            </a>
+            <div className="flex items-center gap-2 min-w-0">
+              {editingName ? (
+                <form onSubmit={saveName} onClick={e => e.stopPropagation()} className="flex items-center gap-2 min-w-0">
+                  <input
+                    value={draftName}
+                    onChange={e => setDraftName(e.target.value)}
+                    className="text-sm font-semibold text-gray-200 truncate bg-surface-2 px-2 py-1 rounded border border-border focus:outline-none focus:border-accent-blue"
+                    autoFocus
+                  />
+                  <button type="submit" className="text-xs text-accent-green hover:text-accent-green/80">Save</button>
+                  <button type="button" onClick={() => { setDraftName(entry.name || ""); setEditingName(false); }}
+                    className="text-xs text-gray-500 hover:text-gray-300">Cancel</button>
+                </form>
+              ) : (
+                <>
+                  <a href={entry.url} target="_blank" rel="noreferrer"
+                    className="text-sm font-semibold text-gray-200 truncate hover:text-accent-blue transition-colors"
+                    title={entry.name}>
+                    {entry.name}
+                  </a>
+                  <button type="button" onClick={e => { e.stopPropagation(); setEditingName(true); }}
+                    className="text-xs text-gray-500 hover:text-gray-300" title="Edit name">✎</button>
+                </>
+              )}
+            </div>
           )}
           {entry.source === "rss" && (
             <span className="flex-shrink-0 px-1.5 py-0.5 rounded border border-orange-400/40 bg-orange-400/10 text-orange-400 text-xs font-bold uppercase tracking-wider">RSS</span>
@@ -635,8 +685,14 @@ function PlaylistCard({ entry, onTagClick, customCats = [], onDelete, onUpdate, 
   const [children, setChildren]       = useState(entry.children || []);
   const [loadingKids, setLoadingKids] = useState(false);
   const [deleting, setDeleting]       = useState(false);
+  const [editingName, setEditingName] = useState(false);
+  const [draftName, setDraftName]     = useState(entry.name || "");
   const [tags, setTags]               = useState(entry.tags || []);
   const [tagInput, setTagInput]       = useState("");
+
+  useEffect(() => {
+    setDraftName(entry.name || "");
+  }, [entry.name]);
 
   const tagSuggestions = useMemo(() => {
     const q = tagInput.trim().toLowerCase();
@@ -678,6 +734,30 @@ function PlaylistCard({ entry, onTagClick, customCats = [], onDelete, onUpdate, 
       finally { setLoadingKids(false); }
     }
     setOpen(o => !o);
+  }
+
+  async function saveName(e) {
+    e?.preventDefault();
+    const nextName = (draftName || "").trim();
+    if (!nextName) {
+      setDraftName(entry.name || "");
+      setEditingName(false);
+      return;
+    }
+    if (nextName === entry.name) {
+      setEditingName(false);
+      return;
+    }
+    const res = await fetch(`${API}/entries/${entry.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: nextName }),
+    });
+    if (res.ok) {
+      const updated = await res.json();
+      onUpdate?.(updated);
+    }
+    setEditingName(false);
   }
 
   async function addTag(tag) {
@@ -722,11 +802,32 @@ function PlaylistCard({ entry, onTagClick, customCats = [], onDelete, onUpdate, 
       <div className="flex items-center gap-3 px-4 py-2.5 bg-surface-2 border-b cursor-pointer select-none"
         style={{ borderColor: divColor }} onClick={handleToggle}>
         <Badge category={entry.category} customCats={customCats} />
-        <a href={entry.url} target="_blank" rel="noreferrer"
-          onClick={e => e.stopPropagation()}
-          className="text-sm font-medium text-gray-200 flex-1 truncate hover:text-accent-blue transition-colors">
-          {entry.name}
-        </a>
+        <div className="flex items-center gap-2 flex-1 min-w-0">
+          {editingName ? (
+            <form onSubmit={saveName} onClick={e => e.stopPropagation()} className="flex items-center gap-2 flex-1 min-w-0">
+              <input
+                value={draftName}
+                onChange={e => setDraftName(e.target.value)}
+                className="text-sm font-medium text-gray-200 truncate bg-surface-2 px-2 py-1 rounded border border-border focus:outline-none focus:border-accent-blue flex-1"
+                autoFocus
+              />
+              <button type="submit" className="text-xs text-accent-green hover:text-accent-green/80">Save</button>
+              <button type="button" onClick={e => { e.stopPropagation(); setDraftName(entry.name || ""); setEditingName(false); }}
+                className="text-xs text-gray-500 hover:text-gray-300">Cancel</button>
+            </form>
+          ) : (
+            <>
+              <a href={entry.url} target="_blank" rel="noreferrer"
+                onClick={e => e.stopPropagation()}
+                className="text-sm font-medium text-gray-200 flex-1 truncate hover:text-accent-blue transition-colors"
+                title={entry.name}>
+                {entry.name}
+              </a>
+              <button type="button" onClick={e => { e.stopPropagation(); setEditingName(true); }}
+                className="text-xs text-gray-500 hover:text-gray-300" title="Edit name">✎</button>
+            </>
+          )}
+        </div>
         <span className="text-xs text-gray-600">{children.length || (entry.children?.length ?? "?")} {childLabel}</span>
         <span className="text-gray-600 text-xs ml-1">{open ? "▲" : "▼"}</span>
         <button onClick={handleDelete} disabled={deleting}
