@@ -722,7 +722,11 @@ function PlaylistCard({ entry, onTagClick, customCats = [], onDelete, onUpdate, 
       <div className="flex items-center gap-3 px-4 py-2.5 bg-surface-2 border-b cursor-pointer select-none"
         style={{ borderColor: divColor }} onClick={handleToggle}>
         <Badge category={entry.category} customCats={customCats} />
-        <span className="text-sm font-medium text-gray-200 flex-1 truncate">{entry.name}</span>
+        <a href={entry.url} target="_blank" rel="noreferrer"
+          onClick={e => e.stopPropagation()}
+          className="text-sm font-medium text-gray-200 flex-1 truncate hover:text-accent-blue transition-colors">
+          {entry.name}
+        </a>
         <span className="text-xs text-gray-600">{children.length || (entry.children?.length ?? "?")} {childLabel}</span>
         <span className="text-gray-600 text-xs ml-1">{open ? "▲" : "▼"}</span>
         <button onClick={handleDelete} disabled={deleting}
