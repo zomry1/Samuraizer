@@ -1610,6 +1610,37 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
     return counts;
   }, [entries]);
 
+  const activeFilters = useMemo(() => {
+    const filters = [];
+    if (debouncedSearch) {
+      filters.push({
+        key: "search",
+        label: `Search: ${debouncedSearch}`,
+        onClear: () => { setSearch(""); setDebounced(""); },
+      });
+    }
+    if (semanticMode) {
+      filters.push({ key: "semantic", label: "Semantic", onClear: () => setSemanticMode(false) });
+    }
+    if (category !== "all") {
+      const label = CAT_META[category]?.label || category;
+      filters.push({ key: "category", label: `Category: ${label}`, onClear: () => setCategory("all") });
+    }
+    if (activeTag) {
+      filters.push({ key: "tag", label: `Tag: ${activeTag}`, onClear: () => setActiveTag("") });
+    }
+    if (sourceFilter !== "all") {
+      const label = sourceFilter === "rss" ? "RSS" : "Manual";
+      filters.push({ key: "source", label: `Source: ${label}`, onClear: () => setSourceFilter("all") });
+    }
+    if (activeList) {
+      const smart = SMART_LISTS.find(s => s.id === activeList);
+      const label = smart ? smart.label : (lists.find(l => l.id === activeList)?.name || "List");
+      filters.push({ key: "list", label: `List: ${label}`, onClear: () => setActiveList(null) });
+    }
+    return filters;
+  }, [debouncedSearch, semanticMode, category, activeTag, sourceFilter, activeList, lists]);
+
   async function toggleRead(id) {
     await fetch(`${API}/entries/${id}/read`, { method: "PATCH" });
     setEntries(prev => prev.map(e => e.id === id ? { ...e, read: !e.read } : e));
@@ -1807,6 +1838,26 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
               ✦ Semantic
             </button>
           </div>
+
+          {/* active filters */}
+          {activeFilters.length > 0 && (
+            <div className="flex flex-wrap items-center gap-2 mb-2">
+              {activeFilters.map(f => (
+                <button key={f.key}
+                  onClick={f.onClear}
+                  className="flex items-center gap-1 text-xs px-2 py-1 rounded bg-surface-2 text-gray-200 hover:bg-surface-3">
+                  {f.label} <span className="text-gray-500">✕</span>
+                </button>
+              ))}
+              <button onClick={() => {
+                  setSearch(""); setDebounced(""); setSemanticMode(false);
+                  setCategory("all"); setActiveTag(""); setSourceFilter("all"); setActiveList(null);
+                }}
+                className="ml-auto text-xs text-gray-400 hover:text-gray-200">
+                clear all
+              </button>
+            </div>
+          )}
 
           {/* source + category filters */}
           <div className="flex flex-col sm:flex-row gap-3">
