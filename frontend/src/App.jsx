@@ -275,8 +275,11 @@ function EntryCard({ entry, onToggleRead, onDelete, onTagClick, lists, onAddToLi
   }
 
   return (
-    <div className="rounded-lg border bg-surface-1 overflow-hidden"
-      style={{ borderColor: selected ? "#3fb950" : "#30363d" }}>
+    <div
+      className="rounded-lg border bg-surface-1 overflow-hidden cursor-pointer"
+      style={{ borderColor: selected ? "#3fb950" : "#30363d" }}
+      onClick={() => { window.open(entry.url, "_blank"); }}
+    >
       {/* header */}
       <div className="flex items-center justify-between px-4 py-2 border-b border-border bg-surface-2">
         <div className="flex items-center gap-2 min-w-0">
