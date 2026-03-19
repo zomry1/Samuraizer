@@ -20,7 +20,7 @@ from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, No
 from google import genai
 from google.genai import types as genai_types
 
-from flask import Flask, request, jsonify, g
+from flask import Flask, request, jsonify, g, Response, stream_with_context
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -122,6 +122,50 @@ def init_db():
                 created_at    TEXT    DEFAULT (datetime('now'))
             )
         """)
+        # Chunked embeddings table (replaces entries.embedding for search)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS entry_chunks (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry_id    INTEGER NOT NULL,
+                chunk_index INTEGER NOT NULL DEFAULT 0,
+                chunk_text  TEXT    NOT NULL DEFAULT '',
+                embedding   TEXT    NOT NULL DEFAULT '',
+                FOREIGN KEY (entry_id) REFERENCES entries(id) ON DELETE CASCADE
+            )
+        """)
+        # Chat sessions
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS chat_sessions (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                title      TEXT    DEFAULT NULL,
+                model      TEXT    NOT NULL DEFAULT 'gemini-2.5-flash',
+                created_at TEXT    DEFAULT (datetime('now')),
+                updated_at TEXT    DEFAULT (datetime('now'))
+            )
+        """)
+        # Chat messages
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL,
+                role       TEXT    NOT NULL,
+                text       TEXT    NOT NULL DEFAULT '',
+                sources    TEXT    NOT NULL DEFAULT '[]',
+                created_at TEXT    DEFAULT (datetime('now')),
+                FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
+            )
+        """)
+        # Migration: wipe old embeddings if dimensions don't match new model (768 → 3072)
+        sample = db.execute("SELECT embedding FROM entries WHERE embedding != '' LIMIT 1").fetchone()
+        if sample:
+            try:
+                old_emb = json.loads(sample["embedding"])
+                if len(old_emb) != 3072:
+                    logger.info("Embedding dimensions changed (%d → 3072), wiping old embeddings…", len(old_emb))
+                    db.execute("UPDATE entries SET embedding = ''")
+                    db.execute("DELETE FROM entry_chunks")
+            except Exception:
+                pass
         db.commit()
 
 
@@ -254,11 +298,24 @@ def _build_system_prompt(custom_cats: list) -> str:
 # ---------------------------------------------------------------------------
 # Embeddings
 # ---------------------------------------------------------------------------
-_EMBED_MODEL = "gemini-embedding-001"
+_EMBED_MODEL = "gemini-embedding-2-preview"
+
+_CHUNK_SIZE    = 6000   # chars per chunk
+_CHUNK_OVERLAP = 300    # overlap between consecutive chunks
 
 
-def _entry_embed_text(name: str, bullets: list, tags: list) -> str:
-    return f"{name}. {' '.join(bullets)}. {' '.join(tags)}"
+def _chunk_text(text: str) -> list[str]:
+    """Split text into overlapping chunks of ~_CHUNK_SIZE chars."""
+    if not text:
+        return []
+    chunks, start = [], 0
+    while start < len(text):
+        end = start + _CHUNK_SIZE
+        chunks.append(text[start:end])
+        if end >= len(text):
+            break
+        start = end - _CHUNK_OVERLAP
+    return chunks
 
 
 def _get_embedding(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> list:
@@ -270,10 +327,31 @@ def _get_embedding(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> list:
     return list(result.embeddings[0].values)
 
 
-def _store_entry_embedding(db, entry_id: int, name: str, bullets: list, tags: list) -> None:
-    text = _entry_embed_text(name or "", bullets or [], tags or [])
-    emb = _get_embedding(text)
-    db.execute("UPDATE entries SET embedding = ? WHERE id = ?", (json.dumps(emb), entry_id))
+def _store_entry_embedding(db, entry_id: int, name: str, bullets: list, tags: list,
+                           content: str = "") -> None:
+    """Chunk the entry content, embed each chunk, and store in entry_chunks."""
+    header = f"{name}. {' '.join(bullets or [])}. {' '.join(tags or [])}."
+    db.execute("DELETE FROM entry_chunks WHERE entry_id = ?", (entry_id,))
+
+    text_chunks = _chunk_text(content.strip()) if content and content.strip() else []
+
+    if text_chunks:
+        for i, chunk in enumerate(text_chunks):
+            # Prepend header so every chunk has contextual identity
+            full_text = f"{header}\n{chunk}"[:8000]
+            emb = _get_embedding(full_text)
+            db.execute(
+                "INSERT INTO entry_chunks (entry_id, chunk_index, chunk_text, embedding) VALUES (?,?,?,?)",
+                (entry_id, i, chunk[:3000], json.dumps(emb)),
+            )
+    else:
+        emb = _get_embedding(header)
+        db.execute(
+            "INSERT INTO entry_chunks (entry_id, chunk_index, chunk_text, embedding) VALUES (?,?,?,?)",
+            (entry_id, 0, header, json.dumps(emb)),
+        )
+
+    db.execute("UPDATE entries SET embedding = '' WHERE id = ?", (entry_id,))
     db.commit()
 
 
@@ -591,6 +669,7 @@ def _process_playlist(url: str):
                         result["name"],
                         result["bullets"],
                         result["tags"],
+                        content,
                     )
                     yield log("  embedding stored")
                 except Exception as exc:
@@ -655,6 +734,7 @@ def _process_playlist(url: str):
                 pl_result["name"],
                 pl_result["bullets"],
                 pl_result["tags"],
+                summary_text,
             )
             yield log("Embedding stored")
         except Exception as exc:
@@ -854,6 +934,7 @@ def _process_blog_listing(url: str, selected_urls: list | None = None, listing_t
                             result["name"],
                             result["bullets"],
                             result["tags"],
+                            content,
                         )
                         yield log("  embedding stored")
                     except Exception as exc:
@@ -926,6 +1007,7 @@ def _process_blog_listing(url: str, selected_urls: list | None = None, listing_t
                     list_result["name"],
                     list_result["bullets"],
                     list_result["tags"],
+                    summary_text,
                 )
                 yield log("Listing embedding stored")
             except Exception as exc:
@@ -1037,6 +1119,7 @@ def _process_url(url: str, source: str = "manual"):
                 result["name"],
                 result["bullets"],
                 result["tags"],
+                content,
             )
             yield log("Embedding stored")
         except Exception as exc:
@@ -1377,6 +1460,7 @@ def retry_summary(entry_id):
                 result["name"],
                 result["bullets"],
                 tags,
+                content,
             )
         except Exception as exc:
             logger.error("Retry embed failed for %d: %s", entry_id, exc)
@@ -1450,30 +1534,45 @@ def semantic_search():
         logger.error("Embed query failed: %s", exc)
         return jsonify({"error": str(exc)}), 500
 
-    db   = get_db()
-    rows = db.execute(
-        "SELECT * FROM entries WHERE embedding IS NOT NULL AND embedding != ''"
-    ).fetchall()
+    db     = get_db()
+    chunks = db.execute("SELECT entry_id, embedding FROM entry_chunks").fetchall()
+    if not chunks:
+        return jsonify([]), 200
 
-    scored = []
-    for row in rows:
+    # Best cosine score per entry across all its chunks
+    entry_scores: dict = {}
+    for chunk in chunks:
         try:
-            emb = json.loads(row["embedding"])
+            emb = json.loads(chunk["embedding"])
             sim = _cosine_sim(query_emb, emb)
-            scored.append((sim, row))
+            eid = chunk["entry_id"]
+            if sim > entry_scores.get(eid, 0):
+                entry_scores[eid] = sim
         except Exception:
             continue
 
-    scored.sort(key=lambda x: -x[0])
-    top       = [x for x in scored[:20] if x[0] > 0.25]
-    entry_ids = [r["id"] for _, r in top]
-    list_map  = _bulk_list_ids(db, entry_ids)
+    top_pairs = sorted(
+        [(eid, s) for eid, s in entry_scores.items() if s > 0.25],
+        key=lambda x: -x[1],
+    )[:20]
+    if not top_pairs:
+        return jsonify([]), 200
+
+    top_ids   = [eid for eid, _ in top_pairs]
+    score_map = {eid: s for eid, s in top_pairs}
+    ph        = ",".join("?" * len(top_ids))
+    rows      = db.execute(f"SELECT * FROM entries WHERE id IN ({ph})", top_ids).fetchall()
+    entry_map = {r["id"]: r for r in rows}
+    list_map  = _bulk_list_ids(db, top_ids)
 
     results = []
-    for sim, row in top:
-        d            = _row_to_dict(row)
-        d["list_ids"] = list_map.get(row["id"], [])
-        d["score"]   = round(sim, 3)
+    for eid in top_ids:
+        row = entry_map.get(eid)
+        if not row:
+            continue
+        d             = _row_to_dict(row)
+        d["list_ids"] = list_map.get(eid, [])
+        d["score"]    = round(score_map[eid], 3)
         results.append(d)
 
     logger.info("Semantic search %r → %d results", q, len(results))
@@ -1482,23 +1581,20 @@ def semantic_search():
 
 @app.route("/entries/embed-all", methods=["POST"])
 def embed_all():
-    """Retroactively compute embeddings for entries that don't have one."""
+    """Chunk and embed all entries that don't have chunks yet."""
     if not _API_KEY:
         return jsonify({"error": "GEMINI_API_KEY not set"}), 500
     db   = get_db()
     rows = db.execute(
-        "SELECT * FROM entries WHERE embedding IS NULL OR embedding = ''"
+        "SELECT * FROM entries WHERE id NOT IN (SELECT DISTINCT entry_id FROM entry_chunks)"
     ).fetchall()
     done, failed = 0, 0
     for row in rows:
         try:
             bullets = json.loads(row["bullets"] or "[]")
             tags    = json.loads(row["tags"]    or "[]")
-            text    = _entry_embed_text(row["name"] or "", bullets, tags)
-            emb     = _get_embedding(text)
-            db.execute("UPDATE entries SET embedding = ? WHERE id = ?",
-                       (json.dumps(emb), row["id"]))
-            db.commit()
+            content = row["content"] or ""
+            _store_entry_embedding(db, row["id"], row["name"] or "", bullets, tags, content)
             done += 1
         except Exception as exc:
             logger.error("embed-all row %d: %s", row["id"], exc)
@@ -1789,6 +1885,236 @@ def poll_rss_feed(feed_id):
     finally:
         poll_db.close()
     return jsonify({"added": added}), 200
+
+
+# ---------------------------------------------------------------------------
+# Chat sessions
+# ---------------------------------------------------------------------------
+
+@app.route("/chat/sessions", methods=["GET"])
+def list_chat_sessions():
+    db   = get_db()
+    rows = db.execute("""
+        SELECT cs.id, cs.title, cs.model, cs.created_at, cs.updated_at,
+               COUNT(cm.id) AS message_count
+        FROM chat_sessions cs
+        LEFT JOIN chat_messages cm ON cm.session_id = cs.id
+        GROUP BY cs.id
+        ORDER BY cs.updated_at DESC
+    """).fetchall()
+    return jsonify([dict(r) for r in rows]), 200
+
+
+@app.route("/chat/sessions", methods=["POST"])
+def create_chat_session():
+    body  = request.get_json(silent=True) or {}
+    model = (body.get("model") or "gemini-2.5-flash").strip()
+    title = (body.get("title") or "").strip() or None
+    db    = get_db()
+    cur   = db.execute(
+        "INSERT INTO chat_sessions (title, model) VALUES (?,?)", (title, model)
+    )
+    db.commit()
+    row = db.execute("SELECT * FROM chat_sessions WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return jsonify({**dict(row), "message_count": 0}), 201
+
+
+@app.route("/chat/sessions/<int:session_id>", methods=["PATCH"])
+def rename_chat_session(session_id):
+    body  = request.get_json(silent=True) or {}
+    title = body.get("title", "").strip()
+    if not title:
+        return jsonify({"error": "title required"}), 400
+    db = get_db()
+    db.execute(
+        "UPDATE chat_sessions SET title = ?, updated_at = datetime('now') WHERE id = ?",
+        (title, session_id),
+    )
+    db.commit()
+    return jsonify({"id": session_id, "title": title}), 200
+
+
+@app.route("/chat/sessions/<int:session_id>", methods=["DELETE"])
+def delete_chat_session(session_id):
+    db = get_db()
+    db.execute("DELETE FROM chat_sessions WHERE id = ?", (session_id,))
+    db.commit()
+    return "", 204
+
+
+@app.route("/chat/sessions/<int:session_id>/messages", methods=["GET"])
+def get_chat_messages(session_id):
+    db  = get_db()
+    row = db.execute("SELECT id FROM chat_sessions WHERE id = ?", (session_id,)).fetchone()
+    if not row:
+        return jsonify({"error": "Session not found"}), 404
+    msgs = db.execute(
+        "SELECT id, role, text, sources, created_at FROM chat_messages "
+        "WHERE session_id = ? ORDER BY created_at",
+        (session_id,),
+    ).fetchall()
+    result = []
+    for m in msgs:
+        d = dict(m)
+        try:
+            d["sources"] = json.loads(d["sources"] or "[]")
+        except Exception:
+            d["sources"] = []
+        result.append(d)
+    return jsonify(result), 200
+
+
+_VALID_CHAT_MODELS = {"gemini-2.5-flash", "gemini-2.5-pro", "gemini-1.5-flash", "gemini-1.5-pro"}
+
+_CHAT_SYSTEM_PROMPT = (
+    "You are a cyber-security expert assistant. "
+    "Answer ONLY using the knowledge base context provided below. "
+    "Cite the entry names you used. "
+    "If the answer is not in the context, say so explicitly.\n\n"
+    "KNOWLEDGE BASE CONTEXT:\n{context}"
+)
+
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    body       = request.get_json(silent=True) or {}
+    question   = (body.get("question") or "").strip()
+    session_id = body.get("session_id")
+    model_name = (body.get("model") or _MODEL_NAME).strip()
+
+    if not question:
+        return jsonify({"error": "question required"}), 400
+    if not session_id:
+        return jsonify({"error": "session_id required"}), 400
+    if not _API_KEY:
+        return jsonify({"error": "GEMINI_API_KEY not set"}), 500
+    if model_name not in _VALID_CHAT_MODELS:
+        model_name = _MODEL_NAME
+
+    # Pre-flight: validate session exists (uses request-context DB, safe here)
+    pre_db = get_db()
+    session_row = pre_db.execute("SELECT * FROM chat_sessions WHERE id = ?", (session_id,)).fetchone()
+    if not session_row:
+        return jsonify({"error": "Session not found"}), 404
+    session_title   = session_row["title"]
+    history_rows    = pre_db.execute(
+        "SELECT role, text FROM chat_messages WHERE session_id = ? ORDER BY created_at",
+        (session_id,),
+    ).fetchall()
+    history_data = [(r["role"], r["text"]) for r in history_rows]
+
+    def generate():
+        # Open a dedicated connection — the Flask request context is gone by the
+        # time the generator runs, so we must NOT use get_db() / g here.
+        sdb = sqlite3.connect(DB_PATH)
+        sdb.row_factory = sqlite3.Row
+        nonlocal session_title
+        try:
+            # ── RAG retrieval ──────────────────────────────────────────────
+            try:
+                query_emb = _get_embedding(question, task_type="RETRIEVAL_QUERY")
+            except Exception as exc:
+                yield json.dumps({"type": "error", "message": f"Embedding failed: {exc}"}) + "\n"
+                return
+
+            chunks = sdb.execute(
+                "SELECT entry_id, chunk_text, embedding FROM entry_chunks"
+            ).fetchall()
+
+            entry_scores: dict = {}
+            for chunk in chunks:
+                try:
+                    emb = json.loads(chunk["embedding"])
+                    sim = _cosine_sim(query_emb, emb)
+                    eid = chunk["entry_id"]
+                    if sim > entry_scores.get(eid, (-1, ""))[0]:
+                        entry_scores[eid] = (sim, chunk["chunk_text"])
+                except Exception:
+                    continue
+
+            top_entries = sorted(
+                [(eid, sc, txt) for eid, (sc, txt) in entry_scores.items() if sc > 0.2],
+                key=lambda x: -x[1],
+            )[:8]
+
+            sources, context_parts = [], []
+            if top_entries:
+                top_ids    = [eid for eid, _, _ in top_entries]
+                ph         = ",".join("?" * len(top_ids))
+                entry_rows = sdb.execute(f"SELECT * FROM entries WHERE id IN ({ph})", top_ids).fetchall()
+                entry_map  = {r["id"]: r for r in entry_rows}
+                for eid, score, chunk_text in top_entries:
+                    row = entry_map.get(eid)
+                    if not row:
+                        continue
+                    sources.append({"id": eid, "name": row["name"], "url": row["url"],
+                                     "score": round(score, 3)})
+                    context_parts.append(f"## {row['name']}\nURL: {row['url']}\n\n{chunk_text}")
+
+            yield json.dumps({"type": "sources", "entries": sources}) + "\n"
+
+            context_text  = "\n\n---\n\n".join(context_parts)[:24000] if context_parts \
+                else "No relevant knowledge base entries found."
+            system_prompt = _CHAT_SYSTEM_PROMPT.format(context=context_text)
+
+            # ── Gemini conversation history ────────────────────────────────
+            gemini_contents = []
+            for role, text in history_data:
+                gemini_role = "model" if role == "assistant" else "user"
+                gemini_contents.append({"role": gemini_role, "parts": [{"text": text}]})
+            gemini_contents.append({"role": "user", "parts": [{"text": question}]})
+
+            # ── Stream LLM response ────────────────────────────────────────
+            try:
+                stream = _genai_client.models.generate_content_stream(
+                    model=model_name,
+                    contents=gemini_contents,
+                    config=genai_types.GenerateContentConfig(
+                        system_instruction=system_prompt,
+                        temperature=0.3,
+                        max_output_tokens=2048,
+                        thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
+                    ),
+                )
+                full_response = []
+                for chunk in stream:
+                    text = chunk.text or ""
+                    if text:
+                        full_response.append(text)
+                        yield json.dumps({"type": "chunk", "text": text}) + "\n"
+
+                assembled = "".join(full_response)
+                sdb.execute(
+                    "INSERT INTO chat_messages (session_id, role, text, sources) VALUES (?,?,?,?)",
+                    (session_id, "user", question, "[]"),
+                )
+                sdb.execute(
+                    "INSERT INTO chat_messages (session_id, role, text, sources) VALUES (?,?,?,?)",
+                    (session_id, "assistant", assembled, json.dumps(sources)),
+                )
+                if not session_title:
+                    session_title = question[:60]
+                    sdb.execute(
+                        "UPDATE chat_sessions SET title = ?, updated_at = datetime('now') WHERE id = ?",
+                        (session_title, session_id),
+                    )
+                else:
+                    sdb.execute(
+                        "UPDATE chat_sessions SET updated_at = datetime('now') WHERE id = ?",
+                        (session_id,),
+                    )
+                sdb.commit()
+            except Exception as exc:
+                logger.error("Chat Gemini error: %s", exc)
+                yield json.dumps({"type": "error", "message": str(exc)}) + "\n"
+                return
+
+            yield json.dumps({"type": "done", "title": session_title}) + "\n"
+
+        finally:
+            sdb.close()
+
+    return Response(stream_with_context(generate()), mimetype="application/x-ndjson")
 
 
 # ---------------------------------------------------------------------------

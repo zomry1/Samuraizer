@@ -2013,6 +2013,282 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
   );
 }
 
+// ─── chat ─────────────────────────────────────────────────────────────────────
+
+const CHAT_MODELS = [
+  { id: "gemini-2.5-flash", label: "2.5 Flash (fast)" },
+  { id: "gemini-2.5-pro",   label: "2.5 Pro (deep)" },
+  { id: "gemini-1.5-flash", label: "1.5 Flash" },
+  { id: "gemini-1.5-pro",   label: "1.5 Pro" },
+];
+
+function ChatTab() {
+  const [sessions,       setSessions]       = useState([]);
+  const [activeSession,  setActiveSession]  = useState(null);
+  const [messages,       setMessages]       = useState([]);
+  const [chatInput,      setChatInput]      = useState("");
+  const [chatLoading,    setChatLoading]    = useState(false);
+  const [model,          setModel]          = useState("gemini-2.5-flash");
+  const [renamingId,     setRenamingId]     = useState(null);
+  const [renameVal,      setRenameVal]      = useState("");
+  const bottomRef = useRef(null);
+
+  // Load sessions on mount
+  useEffect(() => {
+    fetch(`${API}/chat/sessions`).then(r => r.json()).then(setSessions).catch(console.error);
+  }, []);
+
+  // Auto-scroll to bottom when messages change
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  async function loadSession(session) {
+    setActiveSession(session);
+    setModel(session.model || "gemini-2.5-flash");
+    const msgs = await fetch(`${API}/chat/sessions/${session.id}/messages`)
+      .then(r => r.json()).catch(() => []);
+    setMessages(msgs.map(m => ({ ...m, sources: m.sources || [] })));
+  }
+
+  async function newChat() {
+    setActiveSession(null);
+    setMessages([]);
+    setChatInput("");
+  }
+
+  async function deleteSession(e, id) {
+    e.stopPropagation();
+    await fetch(`${API}/chat/sessions/${id}`, { method: "DELETE" });
+    setSessions(prev => prev.filter(s => s.id !== id));
+    if (activeSession?.id === id) { setActiveSession(null); setMessages([]); }
+  }
+
+  async function saveRename(id) {
+    const title = renameVal.trim();
+    if (!title) { setRenamingId(null); return; }
+    await fetch(`${API}/chat/sessions/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title }),
+    });
+    setSessions(prev => prev.map(s => s.id === id ? { ...s, title } : s));
+    setRenamingId(null);
+  }
+
+  async function sendMessage() {
+    const question = chatInput.trim();
+    if (!question || chatLoading) return;
+    setChatLoading(true);
+    setChatInput("");
+
+    let session = activeSession;
+    if (!session) {
+      try {
+        const res = await fetch(`${API}/chat/sessions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model }),
+        });
+        session = await res.json();
+        setActiveSession(session);
+        setSessions(prev => [session, ...prev]);
+      } catch (err) {
+        setChatLoading(false);
+        return;
+      }
+    }
+
+    const userMsg      = { role: "user",      text: question, sources: [] };
+    const assistantMsg = { role: "assistant", text: "",       sources: [] };
+    setMessages(prev => [...prev, userMsg, assistantMsg]);
+
+    try {
+      const res     = await fetch(`${API}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question, session_id: session.id, model }),
+      });
+      const reader  = res.body.getReader();
+      const decoder = new TextDecoder();
+      let   buffer  = "";
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop();
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let msg; try { msg = JSON.parse(line); } catch { continue; }
+          if (msg.type === "sources") {
+            setMessages(prev => {
+              const next = [...prev];
+              next[next.length - 1] = { ...next[next.length - 1], sources: msg.entries };
+              return next;
+            });
+          } else if (msg.type === "chunk") {
+            setMessages(prev => {
+              const next = [...prev];
+              next[next.length - 1] = { ...next[next.length - 1], text: next[next.length - 1].text + msg.text };
+              return next;
+            });
+          } else if (msg.type === "done") {
+            const newTitle = msg.title;
+            if (newTitle) {
+              const updated = { ...session, title: newTitle };
+              setActiveSession(updated);
+              setSessions(prev => prev.map(s => s.id === session.id ? { ...s, title: newTitle, updated_at: new Date().toISOString() } : s));
+            }
+            // Refresh sessions list for updated_at ordering
+            fetch(`${API}/chat/sessions`).then(r => r.json()).then(setSessions).catch(console.error);
+          } else if (msg.type === "error") {
+            setMessages(prev => {
+              const next = [...prev];
+              next[next.length - 1] = { ...next[next.length - 1], text: `⚠ Error: ${msg.message}` };
+              return next;
+            });
+          }
+        }
+      }
+    } catch (err) {
+      setMessages(prev => {
+        const next = [...prev];
+        next[next.length - 1] = { ...next[next.length - 1], text: `⚠ ${err.message}` };
+        return next;
+      });
+    } finally {
+      setChatLoading(false);
+    }
+  }
+
+  function handleKeyDown(e) {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+  }
+
+  return (
+    <div className="flex gap-0 h-[calc(100vh-7rem)]" style={{ minHeight: 0 }}>
+      {/* ── Sidebar ── */}
+      <aside className="w-56 flex-shrink-0 border-r border-border flex flex-col gap-0 pr-3">
+        <button onClick={newChat}
+          className="w-full mb-3 px-3 py-1.5 rounded border border-accent-green/40 bg-accent-green/10 text-accent-green text-xs font-bold uppercase tracking-wider hover:bg-accent-green/20 transition-colors">
+          + New Chat
+        </button>
+        <div className="overflow-y-auto flex-1 space-y-0.5">
+          {sessions.length === 0 && (
+            <p className="text-xs text-gray-700 px-1">No saved chats yet.</p>
+          )}
+          {sessions.map(s => (
+            <div key={s.id}
+              onClick={() => loadSession(s)}
+              className={`group flex items-center gap-1 px-2 py-1.5 rounded cursor-pointer text-xs transition-colors
+                ${activeSession?.id === s.id
+                  ? "bg-accent-green/10 text-accent-green border border-accent-green/30"
+                  : "text-gray-500 hover:text-gray-300 hover:bg-surface-1"}`}>
+              {renamingId === s.id ? (
+                <input autoFocus value={renameVal}
+                  onChange={e => setRenameVal(e.target.value)}
+                  onBlur={() => saveRename(s.id)}
+                  onKeyDown={e => { if (e.key === "Enter") saveRename(s.id); if (e.key === "Escape") setRenamingId(null); }}
+                  onClick={e => e.stopPropagation()}
+                  className="flex-1 bg-transparent border-b border-accent-green/50 outline-none text-xs text-gray-200 min-w-0" />
+              ) : (
+                <span className="flex-1 truncate"
+                  onDoubleClick={e => { e.stopPropagation(); setRenamingId(s.id); setRenameVal(s.title || ""); }}>
+                  {s.title || <span className="italic text-gray-700">Untitled</span>}
+                </span>
+              )}
+              <button onClick={e => deleteSession(e, s.id)}
+                className="opacity-0 group-hover:opacity-100 text-gray-700 hover:text-accent-red transition-all flex-shrink-0 text-[10px]">✕</button>
+            </div>
+          ))}
+        </div>
+      </aside>
+
+      {/* ── Chat area ── */}
+      <div className="flex-1 flex flex-col min-w-0 pl-4">
+        {/* Model picker */}
+        <div className="flex items-center gap-3 mb-3 flex-shrink-0">
+          <span className="text-xs text-gray-700 uppercase tracking-widest">Model</span>
+          <select value={model} onChange={e => setModel(e.target.value)}
+            disabled={!!activeSession}
+            className="bg-surface-1 border border-border text-gray-300 text-xs px-2 py-1 rounded outline-none disabled:opacity-50">
+            {CHAT_MODELS.map(m => (
+              <option key={m.id} value={m.id}>{m.label}</option>
+            ))}
+          </select>
+          {activeSession && (
+            <span className="text-[10px] text-gray-700">model locked to session — start a new chat to change</span>
+          )}
+        </div>
+
+        {/* Messages */}
+        <div className="flex-1 overflow-y-auto space-y-4 pr-1" style={{ minHeight: 0 }}>
+          {messages.length === 0 && (
+            <div className="text-center text-gray-700 text-sm mt-16">
+              <div className="text-3xl mb-3">⚔</div>
+              <p>Ask anything about your knowledge base.</p>
+              <p className="text-xs mt-1 text-gray-800">Answers are grounded in your saved articles and repos.</p>
+            </div>
+          )}
+          {messages.map((msg, i) => (
+            <div key={i} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
+              <div className={`max-w-[80%] rounded-lg px-4 py-2.5 text-sm
+                ${msg.role === "user"
+                  ? "bg-accent-green/15 border border-accent-green/30 text-gray-200"
+                  : "bg-surface-1 border border-border text-gray-300"}`}>
+                {msg.role === "assistant" && (
+                  <div className="text-[10px] text-accent-green mb-1 font-bold tracking-widest">⚔ SAMURAIZER</div>
+                )}
+                {msg.text ? (
+                  <pre className="whitespace-pre-wrap font-mono text-xs leading-relaxed">{msg.text}</pre>
+                ) : msg.role === "assistant" ? (
+                  <div className="flex items-center gap-2 text-gray-700"><Spinner sm /><span className="text-xs">Thinking…</span></div>
+                ) : null}
+                {/* Source cards */}
+                {msg.role === "assistant" && msg.sources && msg.sources.length > 0 && (
+                  <div className="mt-3 pt-2 border-t border-border/50 space-y-1.5">
+                    <p className="text-[10px] text-gray-700 uppercase tracking-widest mb-1">Sources used</p>
+                    {msg.sources.map(src => (
+                      <div key={src.id} className="flex items-center gap-2 bg-surface rounded px-2 py-1">
+                        <a href={src.url} target="_blank" rel="noopener noreferrer"
+                          className="flex-1 text-[10px] text-accent-blue hover:underline truncate">{src.name}</a>
+                        <div className="flex items-center gap-1 flex-shrink-0">
+                          <div className="w-12 h-1 rounded bg-border overflow-hidden">
+                            <div className="h-full bg-accent-green rounded" style={{ width: `${Math.round(src.score * 100)}%` }} />
+                          </div>
+                          <span className="text-[9px] text-gray-700">{Math.round(src.score * 100)}%</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          ))}
+          <div ref={bottomRef} />
+        </div>
+
+        {/* Input bar */}
+        <div className="flex-shrink-0 mt-3 flex gap-2 items-end">
+          <textarea
+            value={chatInput} onChange={e => setChatInput(e.target.value)}
+            onKeyDown={handleKeyDown}
+            disabled={chatLoading}
+            rows={2}
+            placeholder="Ask a question… (Enter to send, Shift+Enter for newline)"
+            className="flex-1 bg-surface-1 border border-border rounded px-3 py-2 text-xs text-gray-200 placeholder-gray-700 outline-none focus:border-accent-green/50 resize-none disabled:opacity-50 font-mono" />
+          <button onClick={sendMessage} disabled={chatLoading || !chatInput.trim()}
+            className="px-4 py-2 rounded bg-accent-green/20 border border-accent-green/40 text-accent-green text-xs font-bold uppercase tracking-wider hover:bg-accent-green/30 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex-shrink-0">
+            {chatLoading ? <Spinner sm /> : "Send"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── root ─────────────────────────────────────────────────────────────────────
 
 export default function App() {
@@ -2152,6 +2428,7 @@ export default function App() {
               { id: "kb",      label: "Knowledge Base" },
               { id: "rss",     label: "RSS" },
               { id: "graph",   label: "Graph" },
+              { id: "chat",    label: "💬 Chat" },
             ].map(({ id, label }) => (
               <button key={id} onClick={() => setTab(id)}
                 className={`px-3 py-1 rounded text-xs font-bold uppercase tracking-wider transition-colors flex items-center gap-1.5
@@ -2192,6 +2469,7 @@ export default function App() {
         )}
         {tab === "rss" && <RssTab />}
         {tab === "graph" && <GraphTab />}
+        {tab === "chat" && <ChatTab />}
       </main>
     </div>
   );
