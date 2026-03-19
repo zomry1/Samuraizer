@@ -2022,6 +2022,54 @@ const CHAT_MODELS = [
   { id: "gemini-1.5-pro",   label: "1.5 Pro" },
 ];
 
+function escapeHtml(unsafe) {
+  return unsafe
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function renderMarkdown(md) {
+  if (!md) return "";
+  const inline = (text) => {
+    let t = text;
+    t = t.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+    t = t.replace(/\*(.+?)\*/g, "<em>$1</em>");
+    t = t.replace(/`([^`]+)`/g, "<code class='bg-surface-2 px-1 rounded'>$1</code>");
+    t = t.replace(/\[([^\]]+)\]\(([^\)]+)\)/g,
+      "<a href='$2' target='_blank' rel='noopener noreferrer' class='text-accent-blue hover:underline'>$1</a>");
+    return t;
+  };
+
+  const lines = escapeHtml(md).split(/\r?\n/);
+  let html = "";
+  let inList = false;
+
+  for (let line of lines) {
+    const trimmed = line.trim();
+    const m = trimmed.match(/^[-*+]\s+(.*)$/);
+    if (m) {
+      if (!inList) {
+        inList = true;
+        html += "<ul class='list-disc list-inside mb-2'>";
+      }
+      html += `<li>${inline(m[1])}</li>`;
+    } else {
+      if (inList) {
+        html += "</ul>";
+        inList = false;
+      }
+      if (!trimmed) {
+        html += "<br/>";
+      } else {
+        html += `<p class='mb-1'>${inline(trimmed)}</p>`;
+      }
+    }
+  }
+  if (inList) html += "</ul>";
+  return html;
+}
+
 function ChatTab() {
   const [sessions,       setSessions]       = useState([]);
   const [activeSession,  setActiveSession]  = useState(null);
@@ -2242,7 +2290,10 @@ function ChatTab() {
                   <div className="text-[10px] text-accent-green mb-1 font-bold tracking-widest">⚔ SAMURAIZER</div>
                 )}
                 {msg.text ? (
-                  <pre className="whitespace-pre-wrap font-mono text-xs leading-relaxed">{msg.text}</pre>
+                  <div
+                    className="text-xs leading-relaxed"
+                    dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.text) }}
+                  />
                 ) : msg.role === "assistant" ? (
                   <div className="flex items-center gap-2 text-gray-700"><Spinner sm /><span className="text-xs">Thinking…</span></div>
                 ) : null}
