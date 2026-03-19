@@ -1600,6 +1600,16 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
   useEffect(() => { fetchEntries(); }, [fetchEntries]);
   useEffect(() => { fetchTags(); },   [fetchTags]);
 
+  const tagCounts = useMemo(() => {
+    const counts = {};
+    for (const entry of entries) {
+      for (const t of entry.tags || []) {
+        counts[t] = (counts[t] || 0) + 1;
+      }
+    }
+    return counts;
+  }, [entries]);
+
   async function toggleRead(id) {
     await fetch(`${API}/entries/${id}/read`, { method: "PATCH" });
     setEntries(prev => prev.map(e => e.id === id ? { ...e, read: !e.read } : e));
@@ -1985,12 +1995,12 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
       </div>
 
       {/* right sidebar: tag cloud */}
-      {allTags.length > 0 && (
+      {Object.keys(tagCounts).length > 0 && (
         <aside className="w-36 flex-shrink-0">
           <div className="sticky top-8">
             <p className="text-xs text-gray-700 uppercase tracking-widest mb-2">Tags</p>
             <div className="space-y-0.5">
-              {allTags.map(({ tag, count }) => (
+              {Object.entries(tagCounts).sort((a, b) => b[1] - a[1]).map(([tag, count]) => (
                 <button key={tag} onClick={() => setActiveTag(prev => prev === tag ? "" : tag)}
                   className={`w-full text-left px-2 py-1 rounded text-xs font-mono transition-colors truncate
                     ${activeTag === tag
