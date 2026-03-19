@@ -274,11 +274,27 @@ function EntryCard({ entry, onToggleRead, onDelete, onTagClick, lists, onAddToLi
     }
   }
 
+  function handleCardClick(e) {
+    // If the user clicked on an interactive element, don’t navigate.
+    if (e.target.closest("button,a,input,textarea,select")) return;
+    if (entry.url) window.open(entry.url, "_blank");
+  }
+
+  function handleCardKeyDown(e) {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      if (entry.url) window.open(entry.url, "_blank");
+    }
+  }
+
   return (
     <div
       className="rounded-lg border bg-surface-1 overflow-hidden cursor-pointer"
       style={{ borderColor: selected ? "#3fb950" : "#30363d" }}
-      onClick={() => { window.open(entry.url, "_blank"); }}
+      onClick={handleCardClick}
+      onKeyDown={handleCardKeyDown}
+      role="button"
+      tabIndex={0}
     >
       {/* header */}
       <div className="flex items-center justify-between px-4 py-2 border-b border-border bg-surface-2">
