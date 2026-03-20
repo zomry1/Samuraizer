@@ -3009,7 +3009,7 @@ export default function App() {
             {[
               { id: "analyze", label: "Analyze" },
               { id: "kb",      label: "Knowledge Base" },
-              { id: "rss",     label: "RSS" },
+              { id: "subscriptions", label: "Subscriptions" },
               { id: "graph",   label: "Graph" },
               { id: "chat",    label: "💬 Chat" },
             ].map(({ id, label }) => (
@@ -3051,7 +3051,7 @@ export default function App() {
               ))} />
           </ErrorBoundary>
         )}
-        {tab === "rss" && <RssTab />}
+        {tab === "subscriptions" && <RssTab />}
         {tab === "graph" && <GraphTab />}
         {tab === "chat" && <ChatTab />}
       </main>
