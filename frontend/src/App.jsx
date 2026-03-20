@@ -2785,7 +2785,7 @@ export default function App() {
   return (
     <div className="min-h-screen bg-surface font-mono flex flex-col">
       <header className="border-b border-border bg-surface-1 flex-shrink-0">
-        <div className="max-w-5xl mx-auto px-6 h-12 flex items-center gap-3">
+        <div className="max-w-7xl mx-auto px-6 h-12 flex items-center gap-3">
           <span className="text-accent-green font-bold text-base tracking-tight select-none">⚔ SAMURAIZER</span>
           <span className="text-border select-none">│</span>
           <nav className="flex gap-1 ml-2">
@@ -2812,7 +2812,7 @@ export default function App() {
         </div>
       </header>
 
-      <main className="flex-1 max-w-5xl mx-auto w-full px-6 py-8">
+      <main className="flex-1 max-w-7xl mx-auto w-full px-6 py-8">
         {tab === "analyze" && (
           <AnalyzeTab input={input} setInput={handleInputChange}
             loading={loading} progress={progress} onSubmit={handleSubmit} onBlogSubmit={handleBlogSubmit}
