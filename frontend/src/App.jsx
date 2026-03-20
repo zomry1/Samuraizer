@@ -1030,6 +1030,9 @@ function RssTab() {
   const [chLoading, setChLoading]       = useState(true);
   const [chUrl, setChUrl]               = useState("");
   const [chName, setChName]             = useState("");
+  const [chPreviewing, setChPreviewing] = useState(false);
+  const [chPreview, setChPreview]       = useState(null);   // { channel_id, name, videos }
+  const [chSelected, setChSelected]     = useState(new Set()); // selected video URLs
   const [chAdding, setChAdding]         = useState(false);
   const [chError, setChError]           = useState("");
   const [chPolling, setChPolling]       = useState({});
@@ -1089,21 +1092,61 @@ function RssTab() {
     finally { setPolling(prev => ({ ...prev, [id]: false })); }
   }
 
-  async function handleChAdd(e) {
+  // Step 1: fetch channel videos for selection
+  async function handleChPreview(e) {
     e.preventDefault();
     setChError("");
     if (!chUrl.trim()) return;
-    setChAdding(true);
+    setChPreviewing(true);
+    setChPreview(null);
     try {
+      const res  = await fetch(`${API}/yt-channels/preview`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: chUrl.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok) { setChError(data.error || "Failed to preview channel"); return; }
+      setChPreview(data);
+      // Pre-select all videos by default
+      setChSelected(new Set(data.videos.map(v => v.url)));
+    } catch (e) { setChError("Network error"); }
+    finally { setChPreviewing(false); }
+  }
+
+  function toggleVideo(url) {
+    setChSelected(prev => {
+      const next = new Set(prev);
+      next.has(url) ? next.delete(url) : next.add(url);
+      return next;
+    });
+  }
+
+  function toggleAllVideos(selectAll) {
+    if (!chPreview) return;
+    setChSelected(selectAll ? new Set(chPreview.videos.map(v => v.url)) : new Set());
+  }
+
+  // Step 2: subscribe + queue selected videos for analysis
+  async function handleChSubscribe(analyzeSelected) {
+    if (!chPreview) return;
+    setChAdding(true);
+    setChError("");
+    try {
+      const body = {
+        url:          chUrl.trim(),
+        name:         chName.trim() || chPreview.name,
+        analyze_urls: analyzeSelected ? [...chSelected] : [],
+      };
       const res  = await fetch(`${API}/yt-channels`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: chUrl.trim(), name: chName.trim() }),
+        body: JSON.stringify(body),
       });
       const data = await res.json();
-      if (!res.ok) { setChError(data.error || "Failed to add channel"); return; }
+      if (!res.ok) { setChError(data.error || "Failed to subscribe"); return; }
       setChannels(prev => [data, ...prev]);
-      setChUrl(""); setChName("");
+      setChUrl(""); setChName(""); setChPreview(null); setChSelected(new Set());
     } catch (e) { setChError("Network error"); }
     finally { setChAdding(false); }
   }
@@ -1199,28 +1242,81 @@ function RssTab() {
           <p className="text-xs text-gray-600">Subscribe to a YouTube channel — new videos will be automatically analysed and added to the Knowledge Base every hour. Paste any channel URL (e.g. <span className="font-mono">https://www.youtube.com/@handle</span>).</p>
         </div>
 
-        {/* Add channel form */}
-        <form onSubmit={handleChAdd} className="flex flex-col gap-2">
+        {/* Step 1: URL form */}
+        <form onSubmit={handleChPreview} className="flex flex-col gap-2">
           <div className="flex gap-2">
-            <input value={chUrl} onChange={e => setChUrl(e.target.value)}
+            <input value={chUrl} onChange={e => { setChUrl(e.target.value); setChPreview(null); }}
               placeholder="Channel URL (https://www.youtube.com/@...)"
               className="flex-1 bg-surface-1 border border-border rounded px-3 py-2 text-xs text-gray-200 placeholder-gray-700 font-mono outline-none focus:border-red-400/50" />
             <input value={chName} onChange={e => setChName(e.target.value)}
               placeholder="Label (optional)"
-              className="w-40 bg-surface-1 border border-border rounded px-3 py-2 text-xs text-gray-200 placeholder-gray-700 font-mono outline-none focus:border-red-400/50" />
-            <button type="submit" disabled={chAdding || !chUrl.trim()}
-              className="px-4 py-2 rounded border border-red-400/40 text-red-400 text-xs font-bold hover:bg-red-400/10 transition-colors disabled:opacity-40">
-              {chAdding ? <Spinner sm /> : "+ Subscribe"}
+              className="w-36 bg-surface-1 border border-border rounded px-3 py-2 text-xs text-gray-200 placeholder-gray-700 font-mono outline-none focus:border-red-400/50" />
+            <button type="submit" disabled={chPreviewing || chAdding || !chUrl.trim()}
+              className="px-4 py-2 rounded border border-red-400/40 text-red-400 text-xs font-bold hover:bg-red-400/10 transition-colors disabled:opacity-40 flex items-center gap-1">
+              {chPreviewing ? <><Spinner sm />Loading…</> : "Preview"}
             </button>
           </div>
           {chError && <p className="text-xs text-accent-red">{chError}</p>}
         </form>
 
-        {/* Channel list */}
+        {/* Step 2: Video selection panel */}
+        {chPreview && (
+          <div className="border border-red-400/20 rounded bg-surface-1 p-4 space-y-3">
+            <div className="flex items-center justify-between">
+              <div>
+                <span className="text-xs font-bold text-gray-200">{chPreview.name}</span>
+                <span className="ml-2 text-xs text-gray-600">{chPreview.videos.length} recent videos</span>
+              </div>
+              <div className="flex items-center gap-3">
+                <button onClick={() => toggleAllVideos(true)}
+                  className="text-xs text-gray-500 hover:text-gray-300 transition-colors">Select all</button>
+                <span className="text-gray-700">·</span>
+                <button onClick={() => toggleAllVideos(false)}
+                  className="text-xs text-gray-500 hover:text-gray-300 transition-colors">None</button>
+                <button onClick={() => { setChPreview(null); setChSelected(new Set()); }}
+                  className="text-xs text-gray-700 hover:text-accent-red transition-colors ml-2">✕ Cancel</button>
+              </div>
+            </div>
+
+            {/* Video list with checkboxes */}
+            <div className="space-y-1 max-h-64 overflow-y-auto pr-1">
+              {chPreview.videos.map(v => (
+                <label key={v.url}
+                  className="flex items-start gap-2 px-2 py-1.5 rounded hover:bg-white/5 cursor-pointer group">
+                  <input type="checkbox" checked={chSelected.has(v.url)}
+                    onChange={() => toggleVideo(v.url)}
+                    className="mt-0.5 flex-shrink-0 accent-red-400" />
+                  <div className="min-w-0">
+                    <p className="text-xs text-gray-300 group-hover:text-gray-100 transition-colors leading-snug">{v.title}</p>
+                    {v.published && (
+                      <p className="text-xs text-gray-700 mt-0.5">
+                        {new Date(v.published).toLocaleDateString()}
+                      </p>
+                    )}
+                  </div>
+                </label>
+              ))}
+            </div>
+
+            {/* Subscribe actions */}
+            <div className="flex items-center gap-3 pt-1 border-t border-border">
+              <button onClick={() => handleChSubscribe(true)} disabled={chAdding}
+                className="px-4 py-2 rounded border border-red-400/40 text-red-400 text-xs font-bold hover:bg-red-400/10 transition-colors disabled:opacity-40 flex items-center gap-1">
+                {chAdding ? <><Spinner sm />Subscribing…</> : `Subscribe & analyze ${chSelected.size} selected`}
+              </button>
+              <button onClick={() => handleChSubscribe(false)} disabled={chAdding}
+                className="px-3 py-2 rounded border border-border text-xs text-gray-500 hover:text-gray-300 hover:border-gray-600 transition-colors disabled:opacity-40">
+                Subscribe only (no backfill)
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Subscribed channel list */}
         {chLoading ? (
           <div className="flex items-center gap-2 text-sm text-gray-700"><Spinner /><span>Loading…</span></div>
         ) : channels.length === 0 ? (
-          <div className="text-xs text-gray-700 mt-4">No subscriptions yet. Add a channel above.</div>
+          <div className="text-xs text-gray-700 mt-4">No subscriptions yet. Preview a channel above to subscribe.</div>
         ) : (
           <div className="space-y-2">
             {channels.map(ch => (

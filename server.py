@@ -1997,6 +1997,39 @@ def _resolve_yt_channel(url: str) -> tuple[str, str]:
         raise RuntimeError(f"Failed to resolve YouTube channel: {exc}")
 
 
+def _analyze_selected_yt_videos(channel_db_id: int, urls: list[str]):
+    """Background task: analyse a specific set of YT video URLs for a channel subscription."""
+    db = sqlite3.connect(DB_PATH)
+    db.row_factory = sqlite3.Row
+    try:
+        row = db.execute(
+            "SELECT id, channel_id, name FROM yt_channels WHERE id = ?", (channel_db_id,)
+        ).fetchone()
+        if not row:
+            return
+        auto_list_id = _get_or_create_list(db, row["name"] or row["channel_id"])
+        new_ids = []
+        for url in urls:
+            existing = db.execute("SELECT id FROM entries WHERE url = ?", (url,)).fetchone()
+            if existing:
+                _add_entries_to_list(db, auto_list_id, [existing["id"]])
+                continue
+            try:
+                entry_id = None
+                for event in _process_url(url, source="youtube"):
+                    if event.get("type") == "result":
+                        entry_id = event["entry"]["id"]
+                if entry_id:
+                    new_ids.append(entry_id)
+            except Exception as exc:
+                logger.warning("Selected YT video skipped (%s): %s", url, exc)
+        if new_ids:
+            _add_entries_to_list(db, auto_list_id, new_ids)
+        db.commit()
+    finally:
+        db.close()
+
+
 _YT_FEED_URL = "https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
 
 
@@ -2166,6 +2199,7 @@ def poll_rss_feed(feed_id):
 # ---------------------------------------------------------------------------
 
 @app.route("/yt-channels",                  methods=["OPTIONS"])
+@app.route("/yt-channels/preview",          methods=["OPTIONS"])
 @app.route("/yt-channels/<int:cid>",        methods=["OPTIONS"])
 @app.route("/yt-channels/<int:cid>/poll",   methods=["OPTIONS"])
 def yt_channels_options(*args, **kwargs):
@@ -2174,6 +2208,39 @@ def yt_channels_options(*args, **kwargs):
     resp.headers["Access-Control-Allow-Methods"] = "GET,POST,DELETE,OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
     return resp, 204
+
+
+@app.route("/yt-channels/preview", methods=["POST"])
+def preview_yt_channel():
+    """Resolve a YouTube channel URL and return its latest video list without subscribing."""
+    body = request.get_json(silent=True) or {}
+    url  = str(body.get("url", "")).strip()
+    if not url.startswith(("http://", "https://")):
+        return jsonify({"error": "URL must start with http:// or https://"}), 400
+    try:
+        channel_id, channel_name = _resolve_yt_channel(url)
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 400
+    feed_url = _YT_FEED_URL.format(channel_id=channel_id)
+    try:
+        parsed = feedparser.parse(feed_url)
+    except Exception as exc:
+        return jsonify({"error": f"Failed to fetch channel feed: {exc}"}), 500
+    videos = []
+    for item in parsed.entries:
+        video_url = item.get("link", "").strip()
+        if not video_url or not _extract_video_id(video_url):
+            continue
+        thumbnail = None
+        if getattr(item, "media_thumbnail", None):
+            thumbnail = item.media_thumbnail[0].get("url")
+        videos.append({
+            "url":       video_url,
+            "title":     item.get("title", video_url),
+            "published": item.get("published", ""),
+            "thumbnail": thumbnail,
+        })
+    return jsonify({"channel_id": channel_id, "name": channel_name, "videos": videos}), 200
 
 
 @app.route("/yt-channels", methods=["GET"])
@@ -2197,9 +2264,10 @@ def list_yt_channels():
 
 @app.route("/yt-channels", methods=["POST"])
 def add_yt_channel():
-    body = request.get_json(silent=True) or {}
-    url  = str(body.get("url", "")).strip()
-    name = str(body.get("name", "")).strip()
+    body         = request.get_json(silent=True) or {}
+    url          = str(body.get("url", "")).strip()
+    name         = str(body.get("name", "")).strip()
+    analyze_urls = body.get("analyze_urls")   # list[str] | None; if provided, only these are analysed immediately
     if not url.startswith(("http://", "https://")):
         return jsonify({"error": "URL must start with http:// or https://"}), 400
     try:
@@ -2218,6 +2286,19 @@ def add_yt_channel():
         db.commit()
     except sqlite3.IntegrityError:
         return jsonify({"error": "Channel already subscribed"}), 409
+    channel_db_id = row["id"]
+    if analyze_urls is not None:
+        # Mark last_checked = now so the hourly scheduler only picks up NEW videos from here on.
+        db.execute("UPDATE yt_channels SET last_checked = datetime('now') WHERE id = ?", (channel_db_id,))
+        db.commit()
+        # Analyse only the explicitly selected videos in a background thread.
+        if analyze_urls:
+            t = threading.Thread(
+                target=_analyze_selected_yt_videos,
+                args=(channel_db_id, analyze_urls),
+                daemon=True,
+            )
+            t.start()
     return jsonify(dict(row)), 201
 
 
