@@ -27,6 +27,12 @@ You can interact via:
 - Each feed becomes its own “list”, making it easy to batch-review
 - Feed items show source metadata and can be tagged/filtered like any entry
 
+### YouTube Channel Subscriptions
+- Subscribe to YouTube channels via URL (e.g. https://www.youtube.com/@handle, /channel/UCxxx)
+- Preview latest videos before subscribing and select which videos to analyze
+- On subscribe, selected videos are analyzed immediately; future uploads are auto-polled hourly
+- Runs via `/yt-channels` API and appears in the UI under RSS/YT sections
+
 ### Telegram Bot (Optional)
 - Send URLs to the bot, and it will analyze them through the same backend
 - **Send a PDF file** to the bot — it downloads, analyzes, and returns a result card with a link to view the file
@@ -167,6 +173,13 @@ Streams NDJSON events in the same shape as `/analyze` (using the filename as the
 
 ### List entries
 `GET /entries` (supports filters: `search`, `category`, `tag`, `source`, `list_id`, `read`, `useful`)
+
+### YouTube channel subscriptions
+- `GET /yt-channels` — list subscribed channels (id, channel_id, channel_url, name, last_checked)
+- `POST /yt-channels/preview` — body `{ "url": "https://www.youtube.com/@handle" }`, returns channel info + latest videos (url/title/published)
+- `POST /yt-channels` — body `{ "url": "...", "name": "optional", "analyze_urls": ["https://...", ...] }`; create subscription and optionally analyze selected videos
+- `POST /yt-channels/<id>/poll` — immediate manual poll for a channel
+- `DELETE /yt-channels/<id>` — remove subscription
 
 ### Manage tags
 - Tag edits happen via `PATCH /entries/<id>` with JSON `{ "tags": ["tag1","tag2"] }`
