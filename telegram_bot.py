@@ -391,6 +391,104 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
+# PDF document handler
+# ---------------------------------------------------------------------------
+
+async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _register_chat(context.bot_data, update.effective_chat.id)
+
+    doc     = update.message.document
+    chat_id = update.effective_chat.id
+    fname   = doc.file_name or "document.pdf"
+
+    logger.info("Received PDF '%s' (%d bytes) from chat %s", fname, doc.file_size, chat_id)
+
+    status = await update.message.reply_text(f"📄 Downloading *{_esc(fname)}*…",
+                                             parse_mode=constants.ParseMode.MARKDOWN_V2)
+
+    # Download file bytes via Telegram
+    try:
+        tg_file    = await doc.get_file()
+        file_bytes = await tg_file.download_as_bytearray()
+    except Exception as exc:
+        await status.edit_text(f"❌ Download failed: {_esc(str(exc))}",
+                               parse_mode=constants.ParseMode.MARKDOWN_V2)
+        return
+
+    last_edit_t = 0.0
+
+    async def _update_status(msg: str):
+        nonlocal last_edit_t
+        if time.time() - last_edit_t < 1.0:
+            return
+        last_edit_t = time.time()
+        try:
+            await status.edit_text(msg)
+        except Exception:
+            pass
+
+    await _update_status(f"🔍 Analyzing {fname}…")
+
+    try:
+        with requests.post(
+            f"{SERVER_URL}/analyze-pdf",
+            files={"file": (fname, bytes(file_bytes), "application/pdf")},
+            stream=True, timeout=300,
+        ) as resp:
+            resp.raise_for_status()
+            buffer  = ""
+            result_entry = None
+            error_msg    = None
+            for chunk in resp.iter_content(chunk_size=None):
+                buffer += chunk.decode("utf-8", errors="replace")
+                lines, buffer = buffer.split("\n"), ""
+                buffer = lines.pop()
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        msg = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if msg.get("log"):
+                        await _update_status(f"🔍 `{_esc(fname)}`\n› {msg['log']}")
+                    elif msg.get("entry"):
+                        result_entry = msg["entry"]
+                        await _update_status("✅ Done\\! Sending result…")
+                    elif msg.get("error"):
+                        error_msg = msg["error"]
+    except requests.exceptions.ConnectionError:
+        await status.edit_text(
+            "❌ Cannot reach Samuraizer server\\.\nMake sure `python server\\.py` is running\\.",
+            parse_mode=constants.ParseMode.MARKDOWN_V2,
+        )
+        return
+    except Exception as exc:
+        logger.exception("PDF stream error")
+        await status.edit_text(f"❌ Error: {_esc(str(exc))}",
+                               parse_mode=constants.ParseMode.MARKDOWN_V2)
+        return
+
+    try:
+        await status.delete()
+    except Exception:
+        pass
+
+    if result_entry:
+        await _send_result_card(context, chat_id, result_entry)
+    elif error_msg:
+        await context.bot.send_message(
+            chat_id,
+            f"❌ *Failed*\n`{_esc(fname)}`\n_{_esc(error_msg)}_",
+            parse_mode=constants.ParseMode.MARKDOWN_V2,
+        )
+    else:
+        await context.bot.send_message(chat_id, "⚠️ No result returned\\.",
+                                       parse_mode=constants.ParseMode.MARKDOWN_V2)
+
+
+# ---------------------------------------------------------------------------
 # URL message handler
 # ---------------------------------------------------------------------------
 
@@ -501,13 +599,20 @@ async def _send_result_card(context, chat_id: int, entry: dict):
     tags    = entry.get("tags", [])
     tags_str = "  " + " ".join(f"\\#{_esc(t)}" for t in tags) if tags else ""
     url     = entry["url"]
-    short   = _esc((url[:60] + "…") if len(url) > 63 else url)
+    is_pdf  = url.startswith("pdf:")
+
+    if is_pdf:
+        pdf_url  = f"{SERVER_URL}/entries/{entry['id']}/pdf"
+        link_str = f"[📄 View PDF]({pdf_url})"
+    else:
+        short    = _esc((url[:60] + "…") if len(url) > 63 else url)
+        link_str = f"[{short}]({url})"
 
     text = (
         f"{emoji} *{name}*  `{cat}`\n"
         f"\n{bullets}\n"
         f"{tags_str}\n"
-        f"\n[{short}]({url})"
+        f"\n{link_str}"
     )
 
     markup = InlineKeyboardMarkup([[
@@ -545,6 +650,7 @@ def main():
     app.add_handler(CommandHandler("search",  cmd_search))
     app.add_handler(CommandHandler("suggest", cmd_suggest))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.Document.PDF, handle_pdf))
     app.add_handler(MessageHandler(filters.TEXT | filters.CAPTION, handle_message))
 
     app.job_queue.run_repeating(

@@ -13,3 +13,4 @@ scrapling
 curl-cffi
 playwright
 browserforge
+pymupdf

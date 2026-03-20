@@ -307,13 +307,15 @@ function EntryCard({ entry, onToggleRead, onDelete, onTagClick, lists, onAddToLi
   function handleCardClick(e) {
     // If the user clicked on an interactive element, don’t navigate.
     if (e.target.closest("button,a,input,textarea,select")) return;
-    if (entry.url) window.open(entry.url, "_blank");
+    const target = (entry.has_pdf || entry.url?.startsWith('pdf:')) ? `${API}/entries/${entry.id}/pdf` : entry.url;
+    if (target) window.open(target, "_blank");
   }
 
   function handleCardKeyDown(e) {
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
-      if (entry.url) window.open(entry.url, "_blank");
+      const target = (entry.has_pdf || entry.url?.startsWith('pdf:')) ? `${API}/entries/${entry.id}/pdf` : entry.url;
+      if (target) window.open(target, "_blank");
     }
   }
 
@@ -392,7 +394,8 @@ function EntryCard({ entry, onToggleRead, onDelete, onTagClick, lists, onAddToLi
           {entry.source === "rss" && (
             <span className="flex-shrink-0 px-1.5 py-0.5 rounded border border-orange-400/40 bg-orange-400/10 text-orange-400 text-xs font-bold uppercase tracking-wider">RSS</span>
           )}
-          <a href={entry.url} target="_blank" rel="noreferrer"
+          <a href={(entry.has_pdf || entry.url?.startsWith("pdf:")) ? `${API}/entries/${entry.id}/pdf` : entry.url}
+            target="_blank" rel="noreferrer"
             className="text-xs text-gray-600 hover:text-accent-blue truncate transition-colors font-mono hidden sm:block"
             title={entry.url}>{host}</a>
         </div>
@@ -423,6 +426,13 @@ function EntryCard({ entry, onToggleRead, onDelete, onTagClick, lists, onAddToLi
             className={`text-xs transition-colors ${entry.read ? "text-accent-green" : "text-gray-600 hover:text-accent-green/70"}`}>
             {toggling ? <Spinner sm /> : entry.read ? "✓ read" : "○ unread"}
           </button>
+          {entry.has_pdf && (
+            <a href={`${API}/entries/${entry.id}/pdf?dl=1`} target="_blank" rel="noreferrer"
+              onClick={e => e.stopPropagation()}
+              className="text-xs text-gray-700 hover:text-accent-blue transition-colors" title="Download PDF">
+              ⬇ PDF
+            </a>
+          )}
           <button onClick={async () => { setDeleting(true); await onDelete(entry.id); }}
             disabled={deleting}
             className="text-xs text-gray-700 hover:text-accent-red transition-colors">
@@ -1478,16 +1488,23 @@ function parseUrls(raw) {
   )];
 }
 
-function AnalyzeTab({ input, setInput, loading, progress, onSubmit, onBlogSubmit, lists, onAddToList, onRemoveFromList, onUpdate, customCats = [] }) {
+function AnalyzeTab({ input, setInput, loading, progress, onSubmit, onBlogSubmit, onPdfSubmit, lists, onAddToList, onRemoveFromList, onUpdate, customCats = [] }) {
   const [blogInput,    setBlogInput]    = useState("");
   const [scanState,    setScanState]    = useState("idle"); // idle | scanning | results
   const [scanError,    setScanError]    = useState("");
   const [scanTitle,    setScanTitle]    = useState("");
   const [scanLinks,    setScanLinks]    = useState([]); // [{url, title, selected}]
+  const [pdfFile,      setPdfFile]      = useState(null);
   const urls   = parseUrls(input);
   const isBulk = urls.length > 1;
   const done   = progress.filter(p => p.status !== "pending").length;
   const total  = progress.length;
+
+  function handleFormSubmit(e) {
+    e.preventDefault();
+    if (pdfFile) { onPdfSubmit(pdfFile); }
+    else         { onSubmit(e); }
+  }
 
   async function handleScan(e) {
     e.preventDefault();
@@ -1535,9 +1552,9 @@ function AnalyzeTab({ input, setInput, loading, progress, onSubmit, onBlogSubmit
       <div className="flex gap-5">
         {/* LEFT: regular URL input */}
         <div className="flex-1 min-w-0">
-          <form onSubmit={onSubmit} className="flex flex-col gap-2">
+          <form onSubmit={handleFormSubmit} className="flex flex-col gap-2">
             <div className="relative bg-surface-1 border border-border rounded focus-within:border-accent-green/50 transition-colors">
-              <textarea value={input} onChange={e => setInput(e.target.value)}
+              <textarea value={input} onChange={e => { setInput(e.target.value); setPdfFile(null); }}
                 placeholder={"Paste one or more URLs (one per line):\nhttps://github.com/...\nhttps://blog.example.com/..."}
                 disabled={loading}
                 rows={Math.min(Math.max(urls.length + 1, 2), 8)}
@@ -1549,17 +1566,40 @@ function AnalyzeTab({ input, setInput, loading, progress, onSubmit, onBlogSubmit
               )}
             </div>
             <div className="flex items-center gap-3">
-              <button type="submit" disabled={loading || urls.length === 0}
+              <button type="submit" disabled={loading || (!pdfFile && urls.length === 0)}
                 className="px-5 py-2 rounded text-sm font-bold bg-accent-green/10 text-accent-green border border-accent-green/40
                            hover:bg-accent-green/20 disabled:opacity-30 disabled:cursor-not-allowed transition-colors flex items-center gap-2">
                 {loading && <Spinner sm />}
-                {loading ? (isBulk ? `Analyzing ${done}/${total}…` : "Analyzing…") : (isBulk ? `[ ANALYZE ${urls.length} ]` : "[ ANALYZE ]")}
+                {loading
+                  ? (pdfFile ? "Analyzing PDF…" : (isBulk ? `Analyzing ${done}/${total}…` : "Analyzing…"))
+                  : (pdfFile ? `[ ANALYZE PDF ]` : (isBulk ? `[ ANALYZE ${urls.length} ]` : "[ ANALYZE ]"))}
               </button>
               {loading && isBulk && (
                 <div className="flex-1 h-1.5 bg-surface-2 rounded-full overflow-hidden">
                   <div className="h-full bg-accent-green transition-all duration-300"
                     style={{ width: `${total ? (done / total) * 100 : 0}%` }} />
                 </div>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              <label className={`flex items-center gap-2 cursor-pointer select-none text-xs transition-colors ${
+                pdfFile ? "text-accent-green" : "text-gray-600 hover:text-gray-400"
+              } ${loading ? "opacity-40 pointer-events-none" : ""}` }>
+                <input type="file" accept=".pdf" className="hidden" disabled={loading}
+                  onChange={e => {
+                    const f = e.target.files?.[0];
+                    if (f) { setPdfFile(f); setInput(""); }
+                    e.target.value = "";
+                  }} />
+                <span className="px-3 py-1.5 rounded border border-border bg-surface-1 hover:border-gray-500 transition-colors whitespace-nowrap overflow-hidden max-w-xs text-ellipsis">
+                  📄 {pdfFile ? pdfFile.name : "Upload PDF"}
+                </span>
+              </label>
+              {pdfFile && (
+                <button type="button" onClick={() => setPdfFile(null)} disabled={loading}
+                  className="text-xs text-gray-700 hover:text-accent-red transition-colors disabled:opacity-30">
+                  ✕
+                </button>
               )}
             </div>
           </form>
@@ -2662,6 +2702,45 @@ export default function App() {
     await handleSubmitUrls(urls);
   }
 
+  async function handlePdfSubmit(file) {
+    if (loading) return;
+    setLoading(true);
+    setProgress([{ url: file.name, status: "pending", logs: [] }]);
+    const formData = new FormData();
+    formData.append("file", file);
+    try {
+      const res     = await fetch(`${API}/analyze-pdf`, { method: "POST", body: formData });
+      const reader  = res.body.getReader();
+      const decoder = new TextDecoder();
+      let   buffer  = "";
+      while (true) {
+        const { value, done: sd } = await reader.read();
+        if (sd) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop();
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let msg; try { msg = JSON.parse(line); } catch { continue; }
+          setProgress(prev => prev.map(p => {
+            if (p.url !== msg.url) return p;
+            if (msg.log)   return { ...p, logs: [...p.logs, msg.log] };
+            if (msg.entry) return { ...p, status: "ok",    entry: msg.entry };
+            if (msg.error) return { ...p, status: "error", error: msg.error };
+            return p;
+          }));
+        }
+      }
+      setRefreshKey(k => k + 1);
+    } catch (err) {
+      setProgress(prev => prev.map(p =>
+        p.status === "pending" ? { ...p, status: "error", error: err.message } : p
+      ));
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function handleBlogSubmit(url, selectedUrls = null, listingTitle = null) {
     if (loading) return;
     setLoading(true);
@@ -2737,6 +2816,7 @@ export default function App() {
         {tab === "analyze" && (
           <AnalyzeTab input={input} setInput={handleInputChange}
             loading={loading} progress={progress} onSubmit={handleSubmit} onBlogSubmit={handleBlogSubmit}
+            onPdfSubmit={handlePdfSubmit}
             lists={lists} onAddToList={handleAddToList} onRemoveFromList={handleRemoveFromList}
             customCats={customCats}
             onUpdate={updated => setProgress(prev => prev.map(p =>

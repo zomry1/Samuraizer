@@ -10,12 +10,14 @@ import math
 import time
 import shutil
 import sqlite3
+import hashlib
 import logging
 import threading
 import requests
 import trafilatura
 import feedparser
 from urllib.parse import urlparse, urljoin
+import fitz  # PyMuPDF
 from scrapling import Fetcher as ScraplingFetcher
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 from google import genai
@@ -143,6 +145,8 @@ def init_db():
             db.execute("ALTER TABLE entries ADD COLUMN parent_id INTEGER DEFAULT NULL")
         if "source" not in cols:
             db.execute("ALTER TABLE entries ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")
+        if "pdf_data" not in cols:
+            db.execute("ALTER TABLE entries ADD COLUMN pdf_data BLOB DEFAULT NULL")
         # RSS feeds table
         db.execute("""
             CREATE TABLE IF NOT EXISTS rss_feeds (
@@ -548,10 +552,6 @@ def _call_gemini(content: str, custom_cats: list = []) -> tuple[dict, list[str]]
     logs = []
     if not _API_KEY:
         raise EnvironmentError("GEMINI_API_KEY not set in .env")
-
-    if len(content) > 60_000:
-        logs.append(f"Content truncated from {len(content):,} to 60,000 chars")
-        content = content[:60_000] + "\n\n[... truncated ...]"
 
     logs.append(f"Sending {len(content):,} chars to {_MODEL_NAME}...")
     t0 = time.time()
@@ -1182,6 +1182,7 @@ def _row_to_dict(row, db=None) -> dict:
         "tags":        json.loads(row["tags"] or "[]"),
         "list_ids":    list_ids,
         "has_content": bool(row["content"]),
+        "has_pdf":     bool(row["pdf_data"]) if "pdf_data" in row.keys() else False,
         "read":        bool(row["read"]),
         "useful":      bool(row["useful"]),
         "parent_id":   row["parent_id"] if "parent_id" in row.keys() else None,
@@ -1227,6 +1228,94 @@ def _add_entries_to_list(db, list_id: int, entry_ids: list[int]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# PDF helpers
+# ---------------------------------------------------------------------------
+def _extract_pdf_text(file_bytes: bytes) -> str:
+    """Extract plain text from a PDF byte string (full document, no truncation)."""
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    parts = []
+    for page in doc:
+        parts.append(page.get_text())
+    doc.close()
+    return "".join(parts)
+
+
+def _process_pdf(file_bytes: bytes, filename: str):
+    """Generator: analyse a PDF and yield log/result/error events."""
+    def log(msg):
+        logger.info("[pdf:%s] %s", filename, msg)
+        return {"type": "log", "msg": msg}
+
+    sha = hashlib.sha256(file_bytes).hexdigest()
+    synthetic_url = f"pdf:{sha}"
+
+    db = sqlite3.connect(DB_PATH)
+    db.row_factory = sqlite3.Row
+    try:
+        custom_cats = [dict(r) for r in db.execute(
+            "SELECT slug, label FROM custom_categories ORDER BY id"
+        ).fetchall()]
+
+        row = db.execute("SELECT * FROM entries WHERE url = ?", (synthetic_url,)).fetchone()
+        if row:
+            if not row["pdf_data"]:
+                db.execute("UPDATE entries SET pdf_data = ? WHERE id = ?", (file_bytes, row["id"]))
+                db.commit()
+                yield log("Backfilled PDF data for existing entry")
+                row = db.execute("SELECT * FROM entries WHERE url = ?", (synthetic_url,)).fetchone()
+            else:
+                yield log("Already analyzed — returning saved entry")
+            yield {"type": "result", "entry": _row_to_dict(row, db)}
+            return
+
+        yield log("Extracting text from PDF")
+        try:
+            content = _extract_pdf_text(file_bytes)
+        except Exception as exc:
+            yield {"type": "error", "msg": f"PDF extraction failed: {exc}"}
+            return
+
+        if not content.strip():
+            yield {"type": "error", "msg": "No extractable text — scanned/image-only PDFs are not supported"}
+            return
+
+        yield log(f"Extracted {len(content):,} characters")
+
+        try:
+            result, gemini_logs = _call_gemini(content, custom_cats)
+            for msg in gemini_logs:
+                yield log(msg)
+        except EnvironmentError as exc:
+            yield {"type": "error", "msg": str(exc)}
+            return
+        except Exception as exc:
+            yield {"type": "error", "msg": f"Gemini failed: {exc}"}
+            return
+
+        cur = db.execute(
+            "INSERT INTO entries (url, name, bullets, category, tags, content, source, pdf_data) VALUES (?,?,?,?,?,?,?,?)",
+            (synthetic_url, result["name"], json.dumps(result["bullets"]),
+             result["category"], json.dumps(result["tags"]), content, "pdf", file_bytes),
+        )
+        db.commit()
+        yield log("Saved to knowledge base")
+
+        try:
+            _store_entry_embedding(
+                db, cur.lastrowid,
+                result["name"], result["bullets"], result["tags"], content,
+            )
+            yield log("Embedding stored")
+        except Exception as exc:
+            yield log(f"Embedding skipped: {exc}")
+
+        row = db.execute("SELECT * FROM entries WHERE url = ?", (synthetic_url,)).fetchone()
+        yield {"type": "result", "entry": _row_to_dict(row, db)}
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
 # CORS
 # ---------------------------------------------------------------------------
 @app.after_request
@@ -1238,6 +1327,7 @@ def add_cors(resp):
 
 
 @app.route("/analyze",                                   methods=["OPTIONS"])
+@app.route("/analyze-pdf",                               methods=["OPTIONS"])
 @app.route("/analyze-blog",                              methods=["OPTIONS"])
 @app.route("/scan-blog",                                 methods=["OPTIONS"])
 @app.route("/entries",                                   methods=["OPTIONS"])
@@ -1252,6 +1342,7 @@ def add_cors(resp):
 @app.route("/entries/<int:entry_id>",                    methods=["OPTIONS"])
 @app.route("/entries/<int:entry_id>/read",               methods=["OPTIONS"])
 @app.route("/entries/<int:entry_id>/content",            methods=["OPTIONS"])
+@app.route("/entries/<int:entry_id>/pdf",                methods=["OPTIONS"])
 @app.route("/categories",                                methods=["OPTIONS"])
 @app.route("/categories/<slug>",                         methods=["OPTIONS"])
 @app.route("/entries/<int:entry_id>/children",           methods=["OPTIONS"])
@@ -1293,6 +1384,52 @@ def analyze():
                     yield json.dumps({"url": url, "error": event["msg"]}) + "\n"
 
     return app.response_class(generate(), mimetype="application/x-ndjson")
+
+
+@app.route("/analyze-pdf", methods=["POST"])
+def analyze_pdf():
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+    f = request.files["file"]
+    if not f.filename or not f.filename.lower().endswith(".pdf"):
+        return jsonify({"error": "File must be a .pdf"}), 400
+    filename = f.filename
+    file_bytes = f.read()
+    logger.info("Analyze-PDF request: %s (%d bytes)", filename, len(file_bytes))
+
+    def generate():
+        for event in _process_pdf(file_bytes, filename):
+            if event["type"] == "log":
+                yield json.dumps({"url": filename, "log": event["msg"]}) + "\n"
+            elif event["type"] == "result":
+                yield json.dumps({"url": filename, "entry": event["entry"]}) + "\n"
+            elif event["type"] == "error":
+                yield json.dumps({"url": filename, "error": event["msg"]}) + "\n"
+
+    return app.response_class(stream_with_context(generate()), mimetype="application/x-ndjson")
+
+
+@app.route("/entries/<int:entry_id>/pdf", methods=["GET", "OPTIONS"])
+def download_pdf(entry_id):
+    db = sqlite3.connect(DB_PATH)
+    db.row_factory = sqlite3.Row
+    try:
+        row = db.execute("SELECT url, name, pdf_data FROM entries WHERE id = ?", (entry_id,)).fetchone()
+        if not row:
+            return jsonify({"error": "Not found"}), 404
+        if not row["pdf_data"]:
+            return jsonify({"error": "No PDF stored for this entry"}), 404
+        filename = (row["name"] or f"entry-{entry_id}").replace("/", "_") + ".pdf"
+        # HTTP headers must be latin-1 safe; strip any characters outside that range
+        filename = filename.encode("latin-1", "replace").decode("latin-1")
+        disposition = "attachment" if request.args.get("dl") else "inline"
+        return Response(
+            bytes(row["pdf_data"]),
+            mimetype="application/pdf",
+            headers={"Content-Disposition": f'{disposition}; filename="{filename}"'},
+        )
+    finally:
+        db.close()
 
 
 @app.route("/scan-blog", methods=["POST"])
