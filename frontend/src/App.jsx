@@ -319,15 +319,17 @@ function EntryCard({ entry, onToggleRead, onDelete, onTagClick, lists, onAddToLi
 
   return (
     <div
-      className="rounded-lg border bg-surface-1 overflow-hidden cursor-pointer"
+      className="rounded-lg border bg-surface-1 overflow-hidden"
       style={{ borderColor: selected ? "#3fb950" : "#30363d" }}
-      onClick={handleCardClick}
-      onKeyDown={handleCardKeyDown}
-      role="button"
-      tabIndex={0}
     >
       {/* header */}
-      <div className="flex items-center justify-between px-4 py-2 border-b border-border bg-surface-2">
+      <div
+        className="flex items-center justify-between px-4 py-2 border-b border-border bg-surface-2 cursor-pointer"
+        onClick={handleCardClick}
+        onKeyDown={handleCardKeyDown}
+        role="button"
+        tabIndex={0}
+      >
         <div className="flex items-center gap-2 min-w-0">
           {onSelect && (
             <input type="checkbox" checked={!!selected} onChange={() => onSelect(entry.id)}
