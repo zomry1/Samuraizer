@@ -157,6 +157,17 @@ def init_db():
                 created_at    TEXT    DEFAULT (datetime('now'))
             )
         """)
+        # YouTube channel subscriptions table
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS yt_channels (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id    TEXT    UNIQUE NOT NULL,
+                channel_url   TEXT    NOT NULL DEFAULT '',
+                name          TEXT    NOT NULL DEFAULT '',
+                last_checked  TEXT    DEFAULT NULL,
+                created_at    TEXT    DEFAULT (datetime('now'))
+            )
+        """)
         # Chunked embeddings table (replaces entries.embedding for search)
         db.execute("""
             CREATE TABLE IF NOT EXISTS entry_chunks (
@@ -1968,10 +1979,100 @@ def _poll_all_feeds():
         db.close()
 
 
+def _resolve_yt_channel(url: str) -> tuple[str, str]:
+    """Return (channel_id, channel_name) for a YouTube channel URL.
+
+    Supports @handle, /channel/UCxxx, /c/name, /user/name formats.
+    Raises RuntimeError on failure.
+    """
+    try:
+        from pytubefix import Channel
+        ch = Channel(url)
+        channel_id   = ch.channel_id
+        channel_name = ch.channel_name or ch.title or url
+        if not channel_id:
+            raise RuntimeError("Could not resolve channel ID")
+        return channel_id, channel_name
+    except Exception as exc:
+        raise RuntimeError(f"Failed to resolve YouTube channel: {exc}")
+
+
+_YT_FEED_URL = "https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+
+
+def _poll_yt_channel(db, row) -> int:
+    """Fetch the latest videos for a YouTube channel and analyse new ones.
+
+    Returns the count of newly added entries.
+    """
+    channel_id   = row["channel_id"]
+    channel_name = row["name"] or channel_id
+    feed_url     = _YT_FEED_URL.format(channel_id=channel_id)
+
+    try:
+        parsed = feedparser.parse(feed_url)
+    except Exception as exc:
+        logger.warning("YT channel feed fetch failed for %s: %s", channel_id, exc)
+        return 0
+
+    auto_list_id = _get_or_create_list(db, channel_name)
+
+    added   = 0
+    new_ids = []
+    for item in parsed.entries:
+        # YouTube feed entries use the yt:videoId link element
+        url = item.get("link", "").strip()
+        if not url or not _extract_video_id(url):
+            continue
+        existing = db.execute("SELECT id FROM entries WHERE url = ?", (url,)).fetchone()
+        if existing:
+            _add_entries_to_list(db, auto_list_id, [existing["id"]])
+            continue
+        try:
+            entry_id = None
+            for event in _process_url(url, source="youtube"):
+                if event.get("type") == "error":
+                    logger.warning("YT channel analysis error for %s: %s", url, event.get("msg"))
+                elif event.get("type") == "result":
+                    entry_id = event["entry"]["id"]
+            if entry_id:
+                new_ids.append(entry_id)
+                added += 1
+        except Exception as exc:
+            logger.warning("YT channel item skipped (%s): %s", url, exc)
+
+    if new_ids:
+        _add_entries_to_list(db, auto_list_id, new_ids)
+
+    db.execute(
+        "UPDATE yt_channels SET last_checked = datetime('now') WHERE id = ?",
+        (row["id"],),
+    )
+    db.commit()
+    logger.info("YT channel %s polled: %d new videos added to list '%s'",
+                channel_name, added, channel_name)
+    return added
+
+
+def _poll_all_yt_channels():
+    """Poll all subscribed YouTube channels."""
+    db = sqlite3.connect(DB_PATH)
+    db.row_factory = sqlite3.Row
+    try:
+        channels = db.execute("SELECT id, channel_id, name FROM yt_channels").fetchall()
+        for ch in channels:
+            _poll_yt_channel(db, ch)
+    except Exception as exc:
+        logger.error("YT channel poll error: %s", exc)
+    finally:
+        db.close()
+
+
 def _start_rss_scheduler():
-    """Start a recurring background timer that polls all RSS feeds every hour."""
+    """Start a recurring background timer that polls all RSS feeds and YT channels every hour."""
     def _run():
         _poll_all_feeds()
+        _poll_all_yt_channels()
         t = threading.Timer(3600, _run)
         t.daemon = True
         t.start()
@@ -1979,7 +2080,7 @@ def _start_rss_scheduler():
     initial = threading.Timer(60, _run)
     initial.daemon = True
     initial.start()
-    logger.info("RSS scheduler started (first poll in 60s, then every 3600s)")
+    logger.info("RSS/YT scheduler started (first poll in 60s, then every 3600s)")
 
 
 # ---------------------------------------------------------------------------
@@ -2055,6 +2156,89 @@ def poll_rss_feed(feed_id):
     poll_db.row_factory = sqlite3.Row
     try:
         added = _poll_rss_feed(poll_db, row["id"], row["url"])
+    finally:
+        poll_db.close()
+    return jsonify({"added": added}), 200
+
+
+# ---------------------------------------------------------------------------
+# YouTube channel subscriptions
+# ---------------------------------------------------------------------------
+
+@app.route("/yt-channels",                  methods=["OPTIONS"])
+@app.route("/yt-channels/<int:cid>",        methods=["OPTIONS"])
+@app.route("/yt-channels/<int:cid>/poll",   methods=["OPTIONS"])
+def yt_channels_options(*args, **kwargs):
+    resp = jsonify({})
+    resp.headers["Access-Control-Allow-Origin"]  = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,DELETE,OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return resp, 204
+
+
+@app.route("/yt-channels", methods=["GET"])
+def list_yt_channels():
+    db   = get_db()
+    rows = db.execute(
+        "SELECT id, channel_id, channel_url, name, last_checked, created_at FROM yt_channels ORDER BY created_at DESC"
+    ).fetchall()
+    channels = []
+    for r in rows:
+        channels.append({
+            "id":           r["id"],
+            "channel_id":   r["channel_id"],
+            "channel_url":  r["channel_url"],
+            "name":         r["name"],
+            "last_checked": r["last_checked"],
+            "created_at":   r["created_at"],
+        })
+    return jsonify(channels), 200
+
+
+@app.route("/yt-channels", methods=["POST"])
+def add_yt_channel():
+    body = request.get_json(silent=True) or {}
+    url  = str(body.get("url", "")).strip()
+    name = str(body.get("name", "")).strip()
+    if not url.startswith(("http://", "https://")):
+        return jsonify({"error": "URL must start with http:// or https://"}), 400
+    try:
+        channel_id, resolved_name = _resolve_yt_channel(url)
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 400
+    display_name = name or resolved_name
+    db = get_db()
+    try:
+        row = db.execute(
+            """INSERT INTO yt_channels (channel_id, channel_url, name)
+               VALUES (?, ?, ?)
+               RETURNING id, channel_id, channel_url, name, last_checked, created_at""",
+            (channel_id, url, display_name),
+        ).fetchone()
+        db.commit()
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "Channel already subscribed"}), 409
+    return jsonify(dict(row)), 201
+
+
+@app.route("/yt-channels/<int:cid>", methods=["DELETE"])
+def delete_yt_channel(cid):
+    db = get_db()
+    db.execute("DELETE FROM yt_channels WHERE id = ?", (cid,))
+    db.commit()
+    return "", 204
+
+
+@app.route("/yt-channels/<int:cid>/poll", methods=["POST"])
+def poll_yt_channel_endpoint(cid):
+    db  = get_db()
+    row = db.execute("SELECT id, channel_id, name FROM yt_channels WHERE id = ?", (cid,)).fetchone()
+    if not row:
+        return jsonify({"error": "Channel not found"}), 404
+    poll_db = sqlite3.connect(DB_PATH)
+    poll_db.row_factory = sqlite3.Row
+    try:
+        added = _poll_yt_channel(poll_db, row)
     finally:
         poll_db.close()
     return jsonify({"added": added}), 200

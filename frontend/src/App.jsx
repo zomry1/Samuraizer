@@ -1025,6 +1025,16 @@ function RssTab() {
   const [polling, setPolling]   = useState({}); // { feedId: true }
   const [pollResult, setPollResult] = useState({}); // { feedId: N }
 
+  // YouTube channel subscriptions state
+  const [channels, setChannels]         = useState([]);
+  const [chLoading, setChLoading]       = useState(true);
+  const [chUrl, setChUrl]               = useState("");
+  const [chName, setChName]             = useState("");
+  const [chAdding, setChAdding]         = useState(false);
+  const [chError, setChError]           = useState("");
+  const [chPolling, setChPolling]       = useState({});
+  const [chPollResult, setChPollResult] = useState({});
+
   async function fetchFeeds() {
     try {
       const data = await (await fetch(`${API}/rss-feeds`)).json();
@@ -1033,7 +1043,15 @@ function RssTab() {
     finally { setLoading(false); }
   }
 
-  useEffect(() => { fetchFeeds(); }, []);
+  async function fetchChannels() {
+    try {
+      const data = await (await fetch(`${API}/yt-channels`)).json();
+      setChannels(Array.isArray(data) ? data : []);
+    } catch (e) { console.error(e); }
+    finally { setChLoading(false); }
+  }
+
+  useEffect(() => { fetchFeeds(); fetchChannels(); }, []);
 
   async function handleAdd(e) {
     e.preventDefault();
@@ -1071,69 +1089,172 @@ function RssTab() {
     finally { setPolling(prev => ({ ...prev, [id]: false })); }
   }
 
+  async function handleChAdd(e) {
+    e.preventDefault();
+    setChError("");
+    if (!chUrl.trim()) return;
+    setChAdding(true);
+    try {
+      const res  = await fetch(`${API}/yt-channels`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: chUrl.trim(), name: chName.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok) { setChError(data.error || "Failed to add channel"); return; }
+      setChannels(prev => [data, ...prev]);
+      setChUrl(""); setChName("");
+    } catch (e) { setChError("Network error"); }
+    finally { setChAdding(false); }
+  }
+
+  async function handleChDelete(id) {
+    await fetch(`${API}/yt-channels/${id}`, { method: "DELETE" });
+    setChannels(prev => prev.filter(c => c.id !== id));
+  }
+
+  async function handleChPoll(id) {
+    setChPolling(prev => ({ ...prev, [id]: true }));
+    setChPollResult(prev => ({ ...prev, [id]: null }));
+    try {
+      const res  = await fetch(`${API}/yt-channels/${id}/poll`, { method: "POST" });
+      const data = await res.json();
+      setChPollResult(prev => ({ ...prev, [id]: data.added }));
+      fetchChannels();
+    } catch (e) { setChPollResult(prev => ({ ...prev, [id]: -1 })); }
+    finally { setChPolling(prev => ({ ...prev, [id]: false })); }
+  }
+
   return (
-    <div className="max-w-2xl space-y-6">
-      <div>
-        <h2 className="text-sm font-bold text-gray-300 uppercase tracking-widest mb-1">RSS Feeds</h2>
-        <p className="text-xs text-gray-600">Add RSS/Atom feeds — the server checks for new posts every hour and adds them to the Knowledge Base automatically. RSS entries are KB-only and won't appear in Suggested Read.</p>
+    <div className="max-w-2xl space-y-10">
+      {/* ── RSS Feeds ───────────────────────────────────────── */}
+      <div className="space-y-6">
+        <div>
+          <h2 className="text-sm font-bold text-gray-300 uppercase tracking-widest mb-1">RSS Feeds</h2>
+          <p className="text-xs text-gray-600">Add RSS/Atom feeds — the server checks for new posts every hour and adds them to the Knowledge Base automatically. RSS entries are KB-only and won't appear in Suggested Read.</p>
+        </div>
+
+        {/* Add feed form */}
+        <form onSubmit={handleAdd} className="flex flex-col gap-2">
+          <div className="flex gap-2">
+            <input value={url} onChange={e => setUrl(e.target.value)}
+              placeholder="Feed URL (https://...)"
+              className="flex-1 bg-surface-1 border border-border rounded px-3 py-2 text-xs text-gray-200 placeholder-gray-700 font-mono outline-none focus:border-accent-green/50" />
+            <input value={name} onChange={e => setName(e.target.value)}
+              placeholder="Name (optional)"
+              className="w-40 bg-surface-1 border border-border rounded px-3 py-2 text-xs text-gray-200 placeholder-gray-700 font-mono outline-none focus:border-accent-green/50" />
+            <button type="submit" disabled={adding || !url.trim()}
+              className="px-4 py-2 rounded border border-accent-green/40 text-accent-green text-xs font-bold hover:bg-accent-green/10 transition-colors disabled:opacity-40">
+              {adding ? <Spinner sm /> : "+ Add"}
+            </button>
+          </div>
+          {error && <p className="text-xs text-accent-red">{error}</p>}
+        </form>
+
+        {/* Feed list */}
+        {loading ? (
+          <div className="flex items-center gap-2 text-sm text-gray-700"><Spinner /><span>Loading…</span></div>
+        ) : feeds.length === 0 ? (
+          <div className="text-xs text-gray-700 mt-4">No feeds yet. Add one above.</div>
+        ) : (
+          <div className="space-y-2">
+            {feeds.map(feed => (
+              <div key={feed.id} className="flex items-center justify-between gap-3 px-4 py-3 rounded border border-border bg-surface-1">
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-semibold text-gray-200 truncate">{feed.name || feed.url}</span>
+                    <span className="flex-shrink-0 px-1.5 py-0.5 rounded border border-orange-400/40 bg-orange-400/10 text-orange-400 text-xs font-bold">RSS</span>
+                  </div>
+                  {feed.name && <p className="text-xs text-gray-600 font-mono truncate mt-0.5">{feed.url}</p>}
+                  <p className="text-xs text-gray-700 mt-0.5">
+                    {feed.last_checked
+                      ? `Last checked: ${new Date(feed.last_checked).toLocaleString()}`
+                      : "Not yet checked"}
+                    {" · "}{feed.entry_count ?? 0} RSS entries in KB
+                  </p>
+                </div>
+                <div className="flex items-center gap-2 flex-shrink-0">
+                  {pollResult[feed.id] != null && (
+                    <span className={`text-xs ${pollResult[feed.id] < 0 ? "text-accent-red" : "text-accent-green"}`}>
+                      {pollResult[feed.id] < 0 ? "Error" : `+${pollResult[feed.id]} new`}
+                    </span>
+                  )}
+                  <button onClick={() => handlePoll(feed.id)} disabled={polling[feed.id]}
+                    className="px-2 py-1 rounded border border-border text-xs text-gray-500 hover:text-accent-blue hover:border-accent-blue/40 transition-colors disabled:opacity-40 flex items-center gap-1">
+                    {polling[feed.id] ? <><Spinner sm />Polling…</> : "↻ Poll now"}
+                  </button>
+                  <button onClick={() => handleDelete(feed.id)}
+                    className="text-xs text-gray-700 hover:text-accent-red transition-colors">✕</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
-      {/* Add feed form */}
-      <form onSubmit={handleAdd} className="flex flex-col gap-2">
-        <div className="flex gap-2">
-          <input value={url} onChange={e => setUrl(e.target.value)}
-            placeholder="Feed URL (https://...)"
-            className="flex-1 bg-surface-1 border border-border rounded px-3 py-2 text-xs text-gray-200 placeholder-gray-700 font-mono outline-none focus:border-accent-green/50" />
-          <input value={name} onChange={e => setName(e.target.value)}
-            placeholder="Name (optional)"
-            className="w-40 bg-surface-1 border border-border rounded px-3 py-2 text-xs text-gray-200 placeholder-gray-700 font-mono outline-none focus:border-accent-green/50" />
-          <button type="submit" disabled={adding || !url.trim()}
-            className="px-4 py-2 rounded border border-accent-green/40 text-accent-green text-xs font-bold hover:bg-accent-green/10 transition-colors disabled:opacity-40">
-            {adding ? <Spinner sm /> : "+ Add"}
-          </button>
+      {/* ── YouTube Subscriptions ───────────────────────────── */}
+      <div className="space-y-6">
+        <div>
+          <h2 className="text-sm font-bold text-gray-300 uppercase tracking-widest mb-1">YouTube Subscriptions</h2>
+          <p className="text-xs text-gray-600">Subscribe to a YouTube channel — new videos will be automatically analysed and added to the Knowledge Base every hour. Paste any channel URL (e.g. <span className="font-mono">https://www.youtube.com/@handle</span>).</p>
         </div>
-        {error && <p className="text-xs text-accent-red">{error}</p>}
-      </form>
 
-      {/* Feed list */}
-      {loading ? (
-        <div className="flex items-center gap-2 text-sm text-gray-700"><Spinner /><span>Loading…</span></div>
-      ) : feeds.length === 0 ? (
-        <div className="text-xs text-gray-700 mt-4">No feeds yet. Add one above.</div>
-      ) : (
-        <div className="space-y-2">
-          {feeds.map(feed => (
-            <div key={feed.id} className="flex items-center justify-between gap-3 px-4 py-3 rounded border border-border bg-surface-1">
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-2">
-                  <span className="text-xs font-semibold text-gray-200 truncate">{feed.name || feed.url}</span>
-                  <span className="flex-shrink-0 px-1.5 py-0.5 rounded border border-orange-400/40 bg-orange-400/10 text-orange-400 text-xs font-bold">RSS</span>
+        {/* Add channel form */}
+        <form onSubmit={handleChAdd} className="flex flex-col gap-2">
+          <div className="flex gap-2">
+            <input value={chUrl} onChange={e => setChUrl(e.target.value)}
+              placeholder="Channel URL (https://www.youtube.com/@...)"
+              className="flex-1 bg-surface-1 border border-border rounded px-3 py-2 text-xs text-gray-200 placeholder-gray-700 font-mono outline-none focus:border-red-400/50" />
+            <input value={chName} onChange={e => setChName(e.target.value)}
+              placeholder="Label (optional)"
+              className="w-40 bg-surface-1 border border-border rounded px-3 py-2 text-xs text-gray-200 placeholder-gray-700 font-mono outline-none focus:border-red-400/50" />
+            <button type="submit" disabled={chAdding || !chUrl.trim()}
+              className="px-4 py-2 rounded border border-red-400/40 text-red-400 text-xs font-bold hover:bg-red-400/10 transition-colors disabled:opacity-40">
+              {chAdding ? <Spinner sm /> : "+ Subscribe"}
+            </button>
+          </div>
+          {chError && <p className="text-xs text-accent-red">{chError}</p>}
+        </form>
+
+        {/* Channel list */}
+        {chLoading ? (
+          <div className="flex items-center gap-2 text-sm text-gray-700"><Spinner /><span>Loading…</span></div>
+        ) : channels.length === 0 ? (
+          <div className="text-xs text-gray-700 mt-4">No subscriptions yet. Add a channel above.</div>
+        ) : (
+          <div className="space-y-2">
+            {channels.map(ch => (
+              <div key={ch.id} className="flex items-center justify-between gap-3 px-4 py-3 rounded border border-border bg-surface-1">
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-semibold text-gray-200 truncate">{ch.name || ch.channel_id}</span>
+                    <span className="flex-shrink-0 px-1.5 py-0.5 rounded border border-red-400/40 bg-red-400/10 text-red-400 text-xs font-bold">🎥 YT</span>
+                  </div>
+                  {ch.name && <p className="text-xs text-gray-600 font-mono truncate mt-0.5">{ch.channel_url}</p>}
+                  <p className="text-xs text-gray-700 mt-0.5">
+                    {ch.last_checked
+                      ? `Last checked: ${new Date(ch.last_checked).toLocaleString()}`
+                      : "Not yet checked"}
+                  </p>
                 </div>
-                {feed.name && <p className="text-xs text-gray-600 font-mono truncate mt-0.5">{feed.url}</p>}
-                <p className="text-xs text-gray-700 mt-0.5">
-                  {feed.last_checked
-                    ? `Last checked: ${new Date(feed.last_checked).toLocaleString()}`
-                    : "Not yet checked"}
-                  {" · "}{feed.entry_count ?? 0} RSS entries in KB
-                </p>
+                <div className="flex items-center gap-2 flex-shrink-0">
+                  {chPollResult[ch.id] != null && (
+                    <span className={`text-xs ${chPollResult[ch.id] < 0 ? "text-accent-red" : "text-accent-green"}`}>
+                      {chPollResult[ch.id] < 0 ? "Error" : `+${chPollResult[ch.id]} new`}
+                    </span>
+                  )}
+                  <button onClick={() => handleChPoll(ch.id)} disabled={chPolling[ch.id]}
+                    className="px-2 py-1 rounded border border-border text-xs text-gray-500 hover:text-accent-blue hover:border-accent-blue/40 transition-colors disabled:opacity-40 flex items-center gap-1">
+                    {chPolling[ch.id] ? <><Spinner sm />Polling…</> : "↻ Poll now"}
+                  </button>
+                  <button onClick={() => handleChDelete(ch.id)}
+                    className="text-xs text-gray-700 hover:text-accent-red transition-colors">✕</button>
+                </div>
               </div>
-              <div className="flex items-center gap-2 flex-shrink-0">
-                {pollResult[feed.id] != null && (
-                  <span className={`text-xs ${pollResult[feed.id] < 0 ? "text-accent-red" : "text-accent-green"}`}>
-                    {pollResult[feed.id] < 0 ? "Error" : `+${pollResult[feed.id]} new`}
-                  </span>
-                )}
-                <button onClick={() => handlePoll(feed.id)} disabled={polling[feed.id]}
-                  className="px-2 py-1 rounded border border-border text-xs text-gray-500 hover:text-accent-blue hover:border-accent-blue/40 transition-colors disabled:opacity-40 flex items-center gap-1">
-                  {polling[feed.id] ? <><Spinner sm />Polling…</> : "↻ Poll now"}
-                </button>
-                <button onClick={() => handleDelete(feed.id)}
-                  className="text-xs text-gray-700 hover:text-accent-red transition-colors">✕</button>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
