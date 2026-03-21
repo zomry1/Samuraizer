@@ -1516,8 +1516,8 @@ def list_entries():
         params.append(category)
 
     if tag:
-        query += ' AND tags LIKE ?'
-        params.append(f'%"{tag}"%')
+        query += ' AND (tags LIKE ? OR id IN (SELECT parent_id FROM entries WHERE parent_id IS NOT NULL AND tags LIKE ?))'
+        params.extend([f'%"{tag}"%', f'%"{tag}"%'])
 
     if list_id:
         query += " AND id IN (SELECT entry_id FROM list_entries WHERE list_id = ?)"
