@@ -505,7 +505,7 @@ function EntryCard({ entry, onToggleRead, onDelete, onTagClick, lists, onAddToLi
 
 // ─── bulk action bar ──────────────────────────────────────────────────────────
 
-function BulkBar({ count, lists, onAddToList, onMarkRead, onMarkUseful, onClear }) {
+function BulkBar({ count, lists, onAddToList, onMarkRead, onMarkUseful, onDeleteSelected, onClear }) {
   const [showPick, setShowPick] = useState(false);
   const [newName, setNewName]   = useState("");
   const ref = useRef(null);
@@ -556,6 +556,10 @@ function BulkBar({ count, lists, onAddToList, onMarkRead, onMarkUseful, onClear 
       <button onClick={onMarkUseful}
         className="px-3 py-1.5 text-xs rounded border border-border text-gray-400 hover:text-yellow-400 hover:border-yellow-400/40 transition-colors">
         ★ Mark useful
+      </button>
+      <button onClick={onDeleteSelected}
+        className="px-3 py-1.5 text-xs rounded border border-border text-accent-red hover:text-white hover:bg-accent-red hover:border-accent-red transition-colors">
+        🗑️ Delete
       </button>
       <button onClick={onClear}
         className="px-3 py-1.5 text-xs rounded border border-border text-gray-600 hover:text-gray-400 transition-colors ml-auto">
@@ -2101,6 +2105,16 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
     setSelectedIds(new Set());
   }
 
+  async function bulkDeleteSelected() {
+    if (!window.confirm(`Delete ${selectedIds.size} selected entr${selectedIds.size === 1 ? "y" : "ies"}?`)) return;
+    await Promise.all([...selectedIds].map(eid =>
+      fetch(`${API}/entries/${eid}`, { method: "DELETE" })
+    ));
+    setEntries(prev => prev.filter(e => !selectedIds.has(e.id)));
+    setSelectedIds(new Set());
+    fetchTags();
+  }
+
   async function createList(name) {
     const res  = await fetch(`${API}/lists`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) });
     const list = await res.json();
@@ -2203,6 +2217,7 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
             onAddToList={bulkAddToList}
             onMarkRead={bulkMarkRead}
             onMarkUseful={bulkMarkUseful}
+            onDeleteSelected={bulkDeleteSelected}
             onClear={() => setSelectedIds(new Set())} />
         )}
 
