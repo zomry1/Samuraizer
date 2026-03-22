@@ -17,6 +17,7 @@ import collections
 import requests
 import trafilatura
 import feedparser
+import json_repair
 from urllib.parse import urlparse, urljoin
 import fitz  # PyMuPDF
 from scrapling import Fetcher as ScraplingFetcher
@@ -648,6 +649,12 @@ def _call_gemini(content: str, custom_cats: list = []) -> tuple[dict, list[str]]
     logs.append(f"Sending {len(content):,} chars to {_MODEL_NAME}...")
     t0 = time.time()
 
+    # Strip ASCII control characters (except tab/newline) that can corrupt Gemini's JSON output
+    content = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", content)
+    # Hard cap at 120k chars to stay well within the model's practical JSON output limit
+    if len(content) > 120_000:
+        content = content[:120_000] + "\n\n[content truncated]"
+
     response = _genai_client.models.generate_content(
         model=_MODEL_NAME,
         contents=content,
@@ -684,7 +691,15 @@ def _call_gemini(content: str, custom_cats: list = []) -> tuple[dict, list[str]]
                 break
     raw = raw[start:end + 1]
 
-    parsed   = json.loads(raw)
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        # Gemini occasionally emits slightly malformed JSON (bad escapes, trailing commas).
+        # json_repair fixes the most common cases without silently swallowing real errors.
+        try:
+            parsed = json_repair.loads(raw)
+        except Exception as repair_exc:
+            raise RuntimeError(f"Gemini returned unparseable JSON: {repair_exc} — raw: {raw[:300]}")
     valid    = {"tool", "agent", "mcp", "list", "workflow", "cve", "article", "video", "playlist"} | {c["slug"] for c in custom_cats}
     name     = str(parsed.get("name", "")).strip()
     bullets  = [str(b).strip() for b in parsed.get("bullets", []) if str(b).strip()][:3]
