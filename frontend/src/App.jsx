@@ -2881,6 +2881,10 @@ const LEVEL_STYLES = {
   CRITICAL: { badge: "bg-red-800/50 text-red-300 border-red-400/50",             row: "text-red-300 font-bold" },
 };
 
+// Minimum-level ordering — module-level constant, never stale inside closures
+const LEVEL_ORDER = { DEBUG: 10, INFO: 20, WARNING: 30, ERROR: 40, CRITICAL: 50 };
+const LEVELS      = ["ALL", "DEBUG", "INFO", "WARNING", "ERROR"];
+
 function LogsTab() {
   const [logs, setLogs]             = useState([]);
   const [levelFilter, setLevelFilter] = useState("ALL");
@@ -2918,11 +2922,6 @@ function LogsTab() {
     } catch { /* ignore */ }
   }
 
-  const LEVELS = ["ALL", "DEBUG", "INFO", "WARNING", "ERROR"];
-
-  // Minimum-level filter: selecting WARNING shows WARNING + ERROR + CRITICAL
-  const LEVEL_ORDER = { DEBUG: 10, INFO: 20, WARNING: 30, ERROR: 40, CRITICAL: 50 };
-
   const counts = useMemo(() => {
     const c = { ALL: logs.length, DEBUG: 0, INFO: 0, WARNING: 0, ERROR: 0 };
     for (const l of logs) {
@@ -2935,11 +2934,11 @@ function LogsTab() {
     return c;
   }, [logs]);
 
-  const visible = useMemo(() => {
-    if (levelFilter === "ALL") return logs;
-    const min = LEVEL_ORDER[levelFilter] ?? 0;
-    return logs.filter(l => (LEVEL_ORDER[l.level] ?? 20) >= min);
-  }, [logs, levelFilter]);
+  // Computed directly (no useMemo) so levelFilter is always the current render value
+  const minOrd  = levelFilter === "ALL" ? 0 : (LEVEL_ORDER[levelFilter] ?? 0);
+  const visible = levelFilter === "ALL"
+    ? logs
+    : logs.filter(l => (LEVEL_ORDER[l.level] ?? 20) >= minOrd);
 
   const activeBtnCls = {
     ALL:     "bg-accent-green/10 text-accent-green border-accent-green/40",
