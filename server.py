@@ -2177,10 +2177,11 @@ def _poll_yt_channel(db, row) -> int:
 
         # Skip videos published before the subscription date
         item_published = item.get("published_parsed")
-        if item_published and row.get("created_at"):
+        row_created_at = row["created_at"] if "created_at" in row.keys() else None
+        if item_published and row_created_at:
             try:
                 pub_dt = datetime.utcfromtimestamp(time.mktime(item_published))
-                sub_dt = datetime.fromisoformat(row["created_at"])
+                sub_dt = datetime.fromisoformat(row_created_at)
                 if pub_dt <= sub_dt:
                     continue
             except Exception:
