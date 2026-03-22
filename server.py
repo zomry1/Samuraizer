@@ -2590,12 +2590,15 @@ def chat():
                     f"SELECT * FROM entries WHERE id IN ({ph})", pinned_ids
                 ).fetchall()
                 for row in entry_rows:
-                    # Pull the best chunk for this entry for context
-                    chunk_row = sdb.execute(
-                        "SELECT chunk_text FROM entry_chunks WHERE entry_id = ? LIMIT 1",
+                    # Pull ALL chunks ordered by index to reconstruct the full content
+                    chunk_rows = sdb.execute(
+                        "SELECT chunk_text FROM entry_chunks WHERE entry_id = ? ORDER BY chunk_index",
                         (row["id"],),
-                    ).fetchone()
-                    chunk_text = chunk_row["chunk_text"] if chunk_row else (row["summary"] or "")
+                    ).fetchall()
+                    if chunk_rows:
+                        chunk_text = "\n\n".join(r["chunk_text"] for r in chunk_rows)
+                    else:
+                        chunk_text = (row["content"] or "").strip()
                     sources.append({"id": row["id"], "name": row["name"],
                                     "url": row["url"], "pinned": True})
                     context_parts.append(f"## {row['name']}\nURL: {row['url']}\n\n{chunk_text}")
