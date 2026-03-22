@@ -13,10 +13,7 @@ import sqlite3
 import hashlib
 import logging
 import threading
-import tempfile
-import subprocess
 import collections
-from datetime import datetime
 import requests
 import trafilatura
 import feedparser
@@ -537,60 +534,6 @@ def _extract_video_id(url: str) -> str | None:
     return m.group("v1") or m.group("v2") or m.group("v3")
 
 
-def _fetch_transcript_ytdlp(video_id: str, logs: list) -> str | None:
-    """Download YouTube subtitles with yt-dlp and return plain text.
-    Tries manual captions first, then auto-generated.
-    Returns None if no transcript could be retrieved.
-    """
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    with tempfile.TemporaryDirectory() as tmpdir:
-        out_tmpl = os.path.join(tmpdir, "%(id)s")
-        for sub_flag, label in (("--write-subs", "manual"), ("--write-auto-subs", "auto-generated")):
-            cmd = [
-                "yt-dlp",
-                "--skip-download",
-                "--sub-format", "vtt",
-                "--sub-langs", "en",
-                sub_flag,
-                "-o", out_tmpl,
-                "--no-playlist",
-                "--quiet",
-                url,
-            ]
-            try:
-                subprocess.run(cmd, check=True, capture_output=True, timeout=60)
-            except subprocess.CalledProcessError as exc:
-                err = exc.stderr.decode(errors="replace").strip()
-                logs.append(f"yt-dlp ({label}) error: {err}")
-                continue
-            except Exception as exc:
-                logs.append(f"yt-dlp ({label}) failed: {exc}")
-                continue
-
-            vtt_files = [f for f in os.listdir(tmpdir) if f.endswith(".vtt")]
-            if not vtt_files:
-                continue
-
-            with open(os.path.join(tmpdir, vtt_files[0]), encoding="utf-8") as fh:
-                raw = fh.read()
-
-            # Strip VTT timestamps/tags → plain text, deduplicate adjacent identical lines
-            lines = []
-            for line in raw.splitlines():
-                line = line.strip()
-                if not line or line.startswith("WEBVTT") or "-->" in line:
-                    continue
-                line = re.sub(r"<[^>]+>", "", line)
-                if not lines or line != lines[-1]:
-                    lines.append(line)
-
-            text = " ".join(lines)
-            logs.append(f"Transcript fetched via yt-dlp ({label}, {len(text):,} chars)")
-            return text
-
-    return None
-
-
 def _fetch_youtube_content(url: str) -> tuple[str, list[str]]:
     logs = []
     video_id = _extract_video_id(url)
@@ -611,10 +554,52 @@ def _fetch_youtube_content(url: str) -> tuple[str, list[str]]:
     except Exception as exc:
         logs.append(f"oEmbed fetch failed (non-fatal): {exc}")
 
-    # Fetch transcript via yt-dlp (handles IP blocks, auto/manual captions)
-    transcript_text = _fetch_transcript_ytdlp(video_id, logs)
+    # Fetch transcript via transcriptapi.com (retries on 408/429/503)
+    transcript_api_key = os.getenv("TRANSCRIPTAPI", "").strip()
+    if not transcript_api_key:
+        raise RuntimeError("TRANSCRIPTAPI key not set in .env")
+
+    headers = {"Authorization": f"Bearer {transcript_api_key}"}
+    transcript_text = None
+    last_error = None
+    for attempt in range(3):
+        try:
+            tr = requests.get(
+                "https://transcriptapi.com/api/v2/youtube/transcript",
+                params={"video_url": video_id, "format": "text", "include_timestamp": "false"},
+                headers=headers,
+                timeout=30,
+            )
+            if tr.status_code == 200:
+                data = tr.json()
+                transcript_text = data.get("transcript", "")
+                logs.append(f"Transcript fetched ({len(transcript_text):,} chars)")
+                break
+            elif tr.status_code in (408, 503):
+                wait = 2 ** attempt
+                logs.append(f"Transcript API returned {tr.status_code}, retrying in {wait}s…")
+                time.sleep(wait)
+                last_error = f"HTTP {tr.status_code}"
+            elif tr.status_code == 429:
+                retry_after = int(tr.headers.get("Retry-After", 5))
+                logs.append(f"Transcript API rate-limited, retrying in {retry_after}s…")
+                time.sleep(retry_after)
+                last_error = "rate limited"
+            elif tr.status_code == 404:
+                raise RuntimeError("No transcript available for this video")
+            elif tr.status_code == 402:
+                raise RuntimeError("Transcript API credits exhausted — top up at transcriptapi.com")
+            elif tr.status_code == 401:
+                raise RuntimeError("TRANSCRIPTAPI key is invalid")
+            else:
+                raise RuntimeError(f"Transcript API error: HTTP {tr.status_code} — {tr.text[:200]}")
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"Transcript API request failed: {exc}")
+
     if not transcript_text:
-        raise RuntimeError("No transcript available for this video (captions disabled or not found)")
+        raise RuntimeError(f"Failed to fetch transcript after 3 attempts ({last_error})")
 
     content = f"# {title}\n\nYouTube URL: {url}\n\n## Transcript\n\n{transcript_text}"
     logs.append(f"Total content size: {len(content):,} chars")
@@ -2174,19 +2159,6 @@ def _poll_yt_channel(db, row) -> int:
         url = item.get("link", "").strip()
         if not url or not _extract_video_id(url):
             continue
-
-        # Skip videos published before the subscription date
-        item_published = item.get("published_parsed")
-        row_created_at = row["created_at"] if "created_at" in row.keys() else None
-        if item_published and row_created_at:
-            try:
-                pub_dt = datetime.utcfromtimestamp(time.mktime(item_published))
-                sub_dt = datetime.fromisoformat(row_created_at)
-                if pub_dt <= sub_dt:
-                    continue
-            except Exception:
-                pass  # unparseable date — proceed anyway
-
         existing = db.execute("SELECT id FROM entries WHERE url = ?", (url,)).fetchone()
         if existing:
             _add_entries_to_list(db, auto_list_id, [existing["id"]])
@@ -2222,7 +2194,7 @@ def _poll_all_yt_channels():
     db = sqlite3.connect(DB_PATH)
     db.row_factory = sqlite3.Row
     try:
-        channels = db.execute("SELECT id, channel_id, name, created_at FROM yt_channels").fetchall()
+        channels = db.execute("SELECT id, channel_id, name FROM yt_channels").fetchall()
         for ch in channels:
             _poll_yt_channel(db, ch)
     except Exception as exc:
