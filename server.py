@@ -2530,12 +2530,28 @@ _CHAT_SYSTEM_PROMPT = (
 )
 
 
+@app.route("/entries/search")
+def search_entries_autocomplete():
+    q    = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify([]), 200
+    db   = get_db()
+    like = f"%{q}%"
+    rows = db.execute(
+        "SELECT id, name, url, category FROM entries WHERE parent_id IS NULL"
+        " AND (name LIKE ? OR url LIKE ?) ORDER BY name LIMIT 20",
+        (like, like),
+    ).fetchall()
+    return jsonify([dict(r) for r in rows]), 200
+
+
 @app.route("/chat", methods=["POST"])
 def chat():
     body       = request.get_json(silent=True) or {}
     question   = (body.get("question") or "").strip()
     session_id = body.get("session_id")
     model_name = (body.get("model") or _MODEL_NAME).strip()
+    pinned_ids = [int(x) for x in (body.get("pinned_ids") or []) if str(x).isdigit()]
 
     if not question:
         return jsonify({"error": "question required"}), 400
@@ -2565,52 +2581,81 @@ def chat():
         sdb.row_factory = sqlite3.Row
         nonlocal session_title
         try:
-            # ── RAG retrieval ──────────────────────────────────────────────
-            try:
-                query_emb = _get_embedding(question, task_type="RETRIEVAL_QUERY")
-            except Exception as exc:
-                yield json.dumps({"type": "error", "message": f"Embedding failed: {exc}"}) + "\n"
-                return
-
-            chunks = sdb.execute(
-                "SELECT entry_id, chunk_text, embedding FROM entry_chunks"
-            ).fetchall()
-
-            entry_scores: dict = {}
-            for chunk in chunks:
-                try:
-                    emb = json.loads(chunk["embedding"])
-                    sim = _cosine_sim(query_emb, emb)
-                    eid = chunk["entry_id"]
-                    if sim > entry_scores.get(eid, (-1, ""))[0]:
-                        entry_scores[eid] = (sim, chunk["chunk_text"])
-                except Exception:
-                    continue
-
-            top_entries = sorted(
-                [(eid, sc, txt) for eid, (sc, txt) in entry_scores.items() if sc > 0.2],
-                key=lambda x: -x[1],
-            )[:8]
-
             sources, context_parts = [], []
-            if top_entries:
-                top_ids    = [eid for eid, _, _ in top_entries]
-                ph         = ",".join("?" * len(top_ids))
-                entry_rows = sdb.execute(f"SELECT * FROM entries WHERE id IN ({ph})", top_ids).fetchall()
-                entry_map  = {r["id"]: r for r in entry_rows}
-                for eid, score, chunk_text in top_entries:
-                    row = entry_map.get(eid)
-                    if not row:
-                        continue
-                    sources.append({"id": eid, "name": row["name"], "url": row["url"],
-                                     "score": round(score, 3)})
+
+            if pinned_ids:
+                # ── Pinned-entry mode: skip RAG, use caller-selected entries ──
+                ph         = ",".join("?" * len(pinned_ids))
+                entry_rows = sdb.execute(
+                    f"SELECT * FROM entries WHERE id IN ({ph})", pinned_ids
+                ).fetchall()
+                for row in entry_rows:
+                    # Pull the best chunk for this entry for context
+                    chunk_row = sdb.execute(
+                        "SELECT chunk_text FROM entry_chunks WHERE entry_id = ? LIMIT 1",
+                        (row["id"],),
+                    ).fetchone()
+                    chunk_text = chunk_row["chunk_text"] if chunk_row else (row["summary"] or "")
+                    sources.append({"id": row["id"], "name": row["name"],
+                                    "url": row["url"], "pinned": True})
                     context_parts.append(f"## {row['name']}\nURL: {row['url']}\n\n{chunk_text}")
+            else:
+                # ── RAG retrieval ──────────────────────────────────────────
+                try:
+                    query_emb = _get_embedding(question, task_type="RETRIEVAL_QUERY")
+                except Exception as exc:
+                    yield json.dumps({"type": "error", "message": f"Embedding failed: {exc}"}) + "\n"
+                    return
+
+                chunks = sdb.execute(
+                    "SELECT entry_id, chunk_text, embedding FROM entry_chunks"
+                ).fetchall()
+
+                entry_scores: dict = {}
+                for chunk in chunks:
+                    try:
+                        emb = json.loads(chunk["embedding"])
+                        sim = _cosine_sim(query_emb, emb)
+                        eid = chunk["entry_id"]
+                        if sim > entry_scores.get(eid, (-1, ""))[0]:
+                            entry_scores[eid] = (sim, chunk["chunk_text"])
+                    except Exception:
+                        continue
+
+                top_entries = sorted(
+                    [(eid, sc, txt) for eid, (sc, txt) in entry_scores.items() if sc > 0.2],
+                    key=lambda x: -x[1],
+                )[:8]
+
+                if top_entries:
+                    top_ids    = [eid for eid, _, _ in top_entries]
+                    ph         = ",".join("?" * len(top_ids))
+                    entry_rows = sdb.execute(f"SELECT * FROM entries WHERE id IN ({ph})", top_ids).fetchall()
+                    entry_map  = {r["id"]: r for r in entry_rows}
+                    for eid, score, chunk_text in top_entries:
+                        row = entry_map.get(eid)
+                        if not row:
+                            continue
+                        sources.append({"id": eid, "name": row["name"], "url": row["url"],
+                                         "score": round(score, 3)})
+                        context_parts.append(f"## {row['name']}\nURL: {row['url']}\n\n{chunk_text}")
 
             yield json.dumps({"type": "sources", "entries": sources}) + "\n"
 
-            context_text  = "\n\n---\n\n".join(context_parts)[:24000] if context_parts \
+            context_text = "\n\n---\n\n".join(context_parts)[:24000] if context_parts \
                 else "No relevant knowledge base entries found."
-            system_prompt = _CHAT_SYSTEM_PROMPT.format(context=context_text)
+
+            if pinned_ids:
+                system_prompt = (
+                    "You are a cyber-security expert assistant. "
+                    "The user has pinned specific articles/entries for this question. "
+                    "Answer ONLY using the pinned entries provided below — do not draw on any other knowledge. "
+                    "Cite the entry names you used. "
+                    "If the answer is not in the pinned entries, say so explicitly.\n\n"
+                    f"PINNED ENTRIES:\n{context_text}"
+                )
+            else:
+                system_prompt = _CHAT_SYSTEM_PROMPT.format(context=context_text)
 
             # ── Gemini conversation history ────────────────────────────────
             gemini_contents = []

@@ -2603,7 +2603,18 @@ function ChatTab() {
   const [model,          setModel]          = useState("gemini-2.5-flash");
   const [renamingId,     setRenamingId]     = useState(null);
   const [renameVal,      setRenameVal]      = useState("");
-  const bottomRef = useRef(null);
+  // Pinned entries & autocomplete
+  const [pinnedEntries,  setPinnedEntries]  = useState([]);
+  const [mention,        setMention]        = useState(null);   // string being typed after @
+  const [suggestions,    setSuggestions]    = useState([]);
+  const [suggestionIdx,  setSuggestionIdx]  = useState(0);
+  // Browse modal
+  const [showBrowse,     setShowBrowse]     = useState(false);
+  const [browseSearch,   setBrowseSearch]   = useState("");
+  const [browseResults,  setBrowseResults]  = useState([]);
+
+  const bottomRef   = useRef(null);
+  const textareaRef = useRef(null);
 
   // Load sessions on mount
   useEffect(() => {
@@ -2615,9 +2626,31 @@ function ChatTab() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  // Autocomplete: fetch suggestions when mention query changes
+  useEffect(() => {
+    if (mention === null || mention === undefined) { setSuggestions([]); return; }
+    const q = mention.trim();
+    if (!q) { setSuggestions([]); return; }
+    fetch(`${API}/entries/search?q=${encodeURIComponent(q)}`)
+      .then(r => r.json())
+      .then(rows => { setSuggestions(rows); setSuggestionIdx(0); })
+      .catch(() => setSuggestions([]));
+  }, [mention]);
+
+  // Browse modal: search entries
+  useEffect(() => {
+    if (!showBrowse) return;
+    const q = browseSearch.trim();
+    fetch(`${API}/entries/search?q=${encodeURIComponent(q || " ")}`)
+      .then(r => r.json())
+      .then(setBrowseResults)
+      .catch(() => setBrowseResults([]));
+  }, [showBrowse, browseSearch]);
+
   async function loadSession(session) {
     setActiveSession(session);
     setModel(session.model || "gemini-2.5-flash");
+    setPinnedEntries([]);
     const msgs = await fetch(`${API}/chat/sessions/${session.id}/messages`)
       .then(r => r.json()).catch(() => []);
     setMessages(msgs.map(m => ({ ...m, sources: m.sources || [] })));
@@ -2627,6 +2660,7 @@ function ChatTab() {
     setActiveSession(null);
     setMessages([]);
     setChatInput("");
+    setPinnedEntries([]);
   }
 
   async function deleteSession(e, id) {
@@ -2648,11 +2682,44 @@ function ChatTab() {
     setRenamingId(null);
   }
 
+  function addPin(entry) {
+    setPinnedEntries(prev => prev.find(p => p.id === entry.id) ? prev : [...prev, entry]);
+  }
+  function removePin(id) {
+    setPinnedEntries(prev => prev.filter(p => p.id !== id));
+  }
+
+  function pickSuggestion(entry) {
+    // Replace the @query in the textarea with just the trimmed text (no @)
+    const val = chatInput;
+    const replaced = val.replace(/@([\w\s\-.]*)$/, "");
+    setChatInput(replaced);
+    setMention(null);
+    setSuggestions([]);
+    addPin(entry);
+    textareaRef.current?.focus();
+  }
+
+  function handleInputChange(e) {
+    const val = e.target.value;
+    setChatInput(val);
+    // Detect @mention trigger: look for @ followed by text at end of string
+    const m = val.match(/@([\w\s\-.]*)$/);
+    if (m) {
+      setMention(m[1]);
+    } else {
+      setMention(null);
+      setSuggestions([]);
+    }
+  }
+
   async function sendMessage() {
     const question = chatInput.trim();
     if (!question || chatLoading) return;
     setChatLoading(true);
     setChatInput("");
+    setMention(null);
+    setSuggestions([]);
 
     let session = activeSession;
     if (!session) {
@@ -2671,15 +2738,20 @@ function ChatTab() {
       }
     }
 
-    const userMsg      = { role: "user",      text: question, sources: [] };
-    const assistantMsg = { role: "assistant", text: "",       sources: [] };
+    const pinnedLabels = pinnedEntries.map(p => `@${p.name}`).join(" ");
+    const displayText  = pinnedLabels ? `${pinnedLabels}\n${question}` : question;
+    const userMsg      = { role: "user",      text: displayText, sources: [], pinned: pinnedEntries.length > 0 };
+    const assistantMsg = { role: "assistant", text: "",          sources: [] };
     setMessages(prev => [...prev, userMsg, assistantMsg]);
 
+    const body = { question, session_id: session.id, model };
+    if (pinnedEntries.length > 0) body.pinned_ids = pinnedEntries.map(p => p.id);
+
     try {
-      const res     = await fetch(`${API}/chat`, {
+      const res = await fetch(`${API}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question, session_id: session.id, model }),
+        body: JSON.stringify(body),
       });
       if (!res.ok) {
         const errText = await res.text();
@@ -2716,11 +2788,9 @@ function ChatTab() {
           } else if (msg.type === "done") {
             const newTitle = msg.title;
             if (newTitle) {
-              const updated = { ...session, title: newTitle };
-              setActiveSession(updated);
+              setActiveSession(prev => ({ ...prev, title: newTitle }));
               setSessions(prev => prev.map(s => s.id === session.id ? { ...s, title: newTitle, updated_at: new Date().toISOString() } : s));
             }
-            // Refresh sessions list for updated_at ordering
             fetch(`${API}/chat/sessions`).then(r => r.json()).then(setSessions).catch(console.error);
           } else if (msg.type === "error") {
             setMessages(prev => {
@@ -2743,6 +2813,17 @@ function ChatTab() {
   }
 
   function handleKeyDown(e) {
+    // Autocomplete navigation
+    if (suggestions.length > 0) {
+      if (e.key === "ArrowDown") { e.preventDefault(); setSuggestionIdx(i => Math.min(i + 1, suggestions.length - 1)); return; }
+      if (e.key === "ArrowUp")   { e.preventDefault(); setSuggestionIdx(i => Math.max(i - 1, 0)); return; }
+      if (e.key === "Enter" || e.key === "Tab") {
+        e.preventDefault();
+        if (suggestions[suggestionIdx]) pickSuggestion(suggestions[suggestionIdx]);
+        return;
+      }
+      if (e.key === "Escape") { setMention(null); setSuggestions([]); return; }
+    }
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
   }
 
@@ -2809,6 +2890,7 @@ function ChatTab() {
               <div className="text-3xl mb-3">⚔</div>
               <p>Ask anything about your knowledge base.</p>
               <p className="text-xs mt-1 text-gray-800">Answers are grounded in your saved articles and repos.</p>
+              <p className="text-xs mt-1 text-gray-800">Type <span className="text-accent-green font-mono">@</span> to pin specific articles as context.</p>
             </div>
           )}
           {messages.map((msg, i) => (
@@ -2836,12 +2918,16 @@ function ChatTab() {
                       <div key={src.id} className="flex items-center gap-2 bg-surface rounded px-2 py-1">
                         <a href={src.url} target="_blank" rel="noopener noreferrer"
                           className="flex-1 text-[10px] text-accent-blue hover:underline truncate">{src.name}</a>
-                        <div className="flex items-center gap-1 flex-shrink-0">
-                          <div className="w-12 h-1 rounded bg-border overflow-hidden">
-                            <div className="h-full bg-accent-green rounded" style={{ width: `${Math.round(src.score * 100)}%` }} />
+                        {src.pinned ? (
+                          <span className="text-[9px] text-accent-yellow flex-shrink-0">📌 pinned</span>
+                        ) : (
+                          <div className="flex items-center gap-1 flex-shrink-0">
+                            <div className="w-12 h-1 rounded bg-border overflow-hidden">
+                              <div className="h-full bg-accent-green rounded" style={{ width: `${Math.round(src.score * 100)}%` }} />
+                            </div>
+                            <span className="text-[9px] text-gray-700">{Math.round(src.score * 100)}%</span>
                           </div>
-                          <span className="text-[9px] text-gray-700">{Math.round(src.score * 100)}%</span>
-                        </div>
+                        )}
                       </div>
                     ))}
                   </div>
@@ -2852,21 +2938,115 @@ function ChatTab() {
           <div ref={bottomRef} />
         </div>
 
+        {/* Pinned entry chips */}
+        {pinnedEntries.length > 0 && (
+          <div className="flex-shrink-0 flex flex-wrap gap-1.5 mt-2 px-1">
+            {pinnedEntries.map(p => (
+              <span key={p.id}
+                className="inline-flex items-center gap-1 bg-accent-yellow/10 border border-accent-yellow/30 text-accent-yellow rounded px-2 py-0.5 text-[10px]">
+                📌 {p.name}
+                <button onClick={() => removePin(p.id)}
+                  className="ml-0.5 text-accent-yellow/60 hover:text-accent-yellow leading-none">✕</button>
+              </span>
+            ))}
+          </div>
+        )}
+
         {/* Input bar */}
-        <div className="flex-shrink-0 mt-3 flex gap-2 items-end">
-          <textarea
-            value={chatInput} onChange={e => setChatInput(e.target.value)}
-            onKeyDown={handleKeyDown}
-            disabled={chatLoading}
-            rows={2}
-            placeholder="Ask a question… (Enter to send, Shift+Enter for newline)"
-            className="flex-1 bg-surface-1 border border-border rounded px-3 py-2 text-xs text-gray-200 placeholder-gray-700 outline-none focus:border-accent-green/50 resize-none disabled:opacity-50 font-mono" />
-          <button onClick={sendMessage} disabled={chatLoading || !chatInput.trim()}
-            className="px-4 py-2 rounded bg-accent-green/20 border border-accent-green/40 text-accent-green text-xs font-bold uppercase tracking-wider hover:bg-accent-green/30 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex-shrink-0">
-            {chatLoading ? <Spinner sm /> : "Send"}
-          </button>
+        <div className="flex-shrink-0 mt-2 relative">
+          {/* Autocomplete dropdown */}
+          {suggestions.length > 0 && (
+            <div className="absolute bottom-full mb-1 left-0 right-0 z-50 bg-surface-1 border border-border rounded shadow-lg max-h-48 overflow-y-auto">
+              {suggestions.map((entry, idx) => (
+                <div key={entry.id}
+                  onMouseDown={e => { e.preventDefault(); pickSuggestion(entry); }}
+                  className={`px-3 py-2 cursor-pointer text-xs flex flex-col gap-0.5
+                    ${idx === suggestionIdx ? "bg-accent-green/15 text-accent-green" : "text-gray-300 hover:bg-surface"}`}>
+                  <span className="font-medium truncate">{entry.name}</span>
+                  <span className="text-[10px] text-gray-700 truncate">{entry.url}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="flex gap-2 items-end">
+            <textarea
+              ref={textareaRef}
+              value={chatInput}
+              onChange={handleInputChange}
+              onKeyDown={handleKeyDown}
+              disabled={chatLoading}
+              rows={2}
+              placeholder="Ask a question… (@ to pin articles, Enter to send)"
+              className="flex-1 bg-surface-1 border border-border rounded px-3 py-2 text-xs text-gray-200 placeholder-gray-700 outline-none focus:border-accent-green/50 resize-none disabled:opacity-50 font-mono" />
+            {/* @ browse button */}
+            <button onClick={() => { setShowBrowse(true); setBrowseSearch(""); }}
+              title="Browse entries to pin"
+              className="px-3 py-2 rounded bg-surface-1 border border-border text-accent-yellow text-xs hover:bg-accent-yellow/10 hover:border-accent-yellow/40 transition-colors flex-shrink-0 font-bold">
+              @
+            </button>
+            <button onClick={sendMessage} disabled={chatLoading || !chatInput.trim()}
+              className="px-4 py-2 rounded bg-accent-green/20 border border-accent-green/40 text-accent-green text-xs font-bold uppercase tracking-wider hover:bg-accent-green/30 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex-shrink-0">
+              {chatLoading ? <Spinner sm /> : "Send"}
+            </button>
+          </div>
         </div>
       </div>
+
+      {/* ── Browse modal ── */}
+      {showBrowse && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
+          onClick={() => setShowBrowse(false)}>
+          <div className="bg-surface-1 border border-border rounded-lg shadow-2xl w-[520px] max-h-[70vh] flex flex-col"
+            onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between px-4 py-3 border-b border-border">
+              <span className="text-sm font-bold text-accent-green tracking-wider">Pin Articles to Chat</span>
+              <button onClick={() => setShowBrowse(false)} className="text-gray-700 hover:text-gray-300 text-xs">✕ Close</button>
+            </div>
+            <div className="px-4 py-2 border-b border-border">
+              <input autoFocus
+                value={browseSearch}
+                onChange={e => setBrowseSearch(e.target.value)}
+                placeholder="Search entries…"
+                className="w-full bg-surface border border-border rounded px-3 py-1.5 text-xs text-gray-200 outline-none focus:border-accent-green/50 placeholder-gray-700" />
+            </div>
+            <div className="flex-1 overflow-y-auto">
+              {browseResults.length === 0 && (
+                <p className="text-xs text-gray-700 text-center py-8">No entries found.</p>
+              )}
+              {browseResults.map(entry => {
+                const pinned = !!pinnedEntries.find(p => p.id === entry.id);
+                return (
+                  <div key={entry.id}
+                    className={`flex items-start gap-3 px-4 py-3 border-b border-border/40 cursor-pointer hover:bg-surface transition-colors
+                      ${pinned ? "bg-accent-yellow/5" : ""}`}
+                    onClick={() => { pinned ? removePin(entry.id) : addPin(entry); }}>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-medium text-gray-200 truncate">{entry.name}</p>
+                      <p className="text-[10px] text-gray-700 truncate">{entry.url}</p>
+                      {entry.category && (
+                        <span className="text-[9px] text-accent-blue mt-0.5 inline-block">{entry.category}</span>
+                      )}
+                    </div>
+                    <span className={`flex-shrink-0 text-[10px] font-bold px-2 py-0.5 rounded border
+                      ${pinned
+                        ? "bg-accent-yellow/15 border-accent-yellow/40 text-accent-yellow"
+                        : "bg-surface border-border text-gray-600"}`}>
+                      {pinned ? "📌 pinned" : "+ pin"}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+            <div className="px-4 py-2 border-t border-border flex items-center justify-between">
+              <span className="text-[10px] text-gray-700">{pinnedEntries.length} pinned</span>
+              <button onClick={() => setShowBrowse(false)}
+                className="px-3 py-1 rounded bg-accent-green/20 border border-accent-green/40 text-accent-green text-xs font-bold hover:bg-accent-green/30 transition-colors">
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
