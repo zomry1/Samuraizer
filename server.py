@@ -13,14 +13,15 @@ import sqlite3
 import hashlib
 import logging
 import threading
-import collections
+import tempfile
+import subprocess
+from datetime import datetime
 import requests
 import trafilatura
 import feedparser
 from urllib.parse import urlparse, urljoin
 import fitz  # PyMuPDF
 from scrapling import Fetcher as ScraplingFetcher
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 from google import genai
 from google.genai import types as genai_types
 
@@ -535,6 +536,60 @@ def _extract_video_id(url: str) -> str | None:
     return m.group("v1") or m.group("v2") or m.group("v3")
 
 
+def _fetch_transcript_ytdlp(video_id: str, logs: list) -> str | None:
+    """Download YouTube subtitles with yt-dlp and return plain text.
+    Tries manual captions first, then auto-generated.
+    Returns None if no transcript could be retrieved.
+    """
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_tmpl = os.path.join(tmpdir, "%(id)s")
+        for sub_flag, label in (("--write-subs", "manual"), ("--write-auto-subs", "auto-generated")):
+            cmd = [
+                "yt-dlp",
+                "--skip-download",
+                "--sub-format", "vtt",
+                "--sub-langs", "en",
+                sub_flag,
+                "-o", out_tmpl,
+                "--no-playlist",
+                "--quiet",
+                url,
+            ]
+            try:
+                subprocess.run(cmd, check=True, capture_output=True, timeout=60)
+            except subprocess.CalledProcessError as exc:
+                err = exc.stderr.decode(errors="replace").strip()
+                logs.append(f"yt-dlp ({label}) error: {err}")
+                continue
+            except Exception as exc:
+                logs.append(f"yt-dlp ({label}) failed: {exc}")
+                continue
+
+            vtt_files = [f for f in os.listdir(tmpdir) if f.endswith(".vtt")]
+            if not vtt_files:
+                continue
+
+            with open(os.path.join(tmpdir, vtt_files[0]), encoding="utf-8") as fh:
+                raw = fh.read()
+
+            # Strip VTT timestamps/tags → plain text, deduplicate adjacent identical lines
+            lines = []
+            for line in raw.splitlines():
+                line = line.strip()
+                if not line or line.startswith("WEBVTT") or "-->" in line:
+                    continue
+                line = re.sub(r"<[^>]+>", "", line)
+                if not lines or line != lines[-1]:
+                    lines.append(line)
+
+            text = " ".join(lines)
+            logs.append(f"Transcript fetched via yt-dlp ({label}, {len(text):,} chars)")
+            return text
+
+    return None
+
+
 def _fetch_youtube_content(url: str) -> tuple[str, list[str]]:
     logs = []
     video_id = _extract_video_id(url)
@@ -555,18 +610,10 @@ def _fetch_youtube_content(url: str) -> tuple[str, list[str]]:
     except Exception as exc:
         logs.append(f"oEmbed fetch failed (non-fatal): {exc}")
 
-    # Fetch transcript
-    try:
-        api = YouTubeTranscriptApi()
-        fetched = api.fetch(video_id)
-        transcript_text = " ".join(snippet.text for snippet in fetched)
-        logs.append(f"Transcript fetched ({len(transcript_text):,} chars, {len(fetched)} segments)")
-    except TranscriptsDisabled:
-        raise RuntimeError("This video has transcripts/captions disabled")
-    except NoTranscriptFound:
-        raise RuntimeError("No transcript found for this video (try a video with captions enabled)")
-    except Exception as exc:
-        raise RuntimeError(f"Failed to fetch transcript: {exc}")
+    # Fetch transcript via yt-dlp (handles IP blocks, auto/manual captions)
+    transcript_text = _fetch_transcript_ytdlp(video_id, logs)
+    if not transcript_text:
+        raise RuntimeError("No transcript available for this video (captions disabled or not found)")
 
     content = f"# {title}\n\nYouTube URL: {url}\n\n## Transcript\n\n{transcript_text}"
     logs.append(f"Total content size: {len(content):,} chars")
@@ -2126,6 +2173,18 @@ def _poll_yt_channel(db, row) -> int:
         url = item.get("link", "").strip()
         if not url or not _extract_video_id(url):
             continue
+
+        # Skip videos published before the subscription date
+        item_published = item.get("published_parsed")
+        if item_published and row.get("created_at"):
+            try:
+                pub_dt = datetime.utcfromtimestamp(time.mktime(item_published))
+                sub_dt = datetime.fromisoformat(row["created_at"])
+                if pub_dt <= sub_dt:
+                    continue
+            except Exception:
+                pass  # unparseable date — proceed anyway
+
         existing = db.execute("SELECT id FROM entries WHERE url = ?", (url,)).fetchone()
         if existing:
             _add_entries_to_list(db, auto_list_id, [existing["id"]])
@@ -2161,7 +2220,7 @@ def _poll_all_yt_channels():
     db = sqlite3.connect(DB_PATH)
     db.row_factory = sqlite3.Row
     try:
-        channels = db.execute("SELECT id, channel_id, name FROM yt_channels").fetchall()
+        channels = db.execute("SELECT id, channel_id, name, created_at FROM yt_channels").fetchall()
         for ch in channels:
             _poll_yt_channel(db, ch)
     except Exception as exc:

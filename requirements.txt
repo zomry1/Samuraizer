@@ -7,7 +7,7 @@ requests
 google-genai
 python-dotenv
 python-telegram-bot[job-queue]>=21.0
-youtube-transcript-api
+yt-dlp
 pytubefix
 scrapling
 curl-cffi
