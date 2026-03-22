@@ -696,8 +696,9 @@ function VideoChildItem({ child, index, onTagClick, onRetried }) {
 
 // ─── playlist card ────────────────────────────────────────────────────────────
 
-function PlaylistCard({ entry, onTagClick, customCats = [], onDelete, onUpdate, allTags = [] }) {
-  const [open, setOpen]               = useState(false);
+function PlaylistCard({ entry, onTagClick, customCats = [], onDelete, onUpdate, allTags = [], matchedChildIds = [] }) {
+  const hasChildMatches               = matchedChildIds.length > 0;
+  const [open, setOpen]               = useState(hasChildMatches);
   const [children, setChildren]       = useState(entry.children || []);
   const [loadingKids, setLoadingKids] = useState(false);
   const [deleting, setDeleting]       = useState(false);
@@ -705,6 +706,24 @@ function PlaylistCard({ entry, onTagClick, customCats = [], onDelete, onUpdate, 
   const [draftName, setDraftName]     = useState(entry.name || "");
   const [tags, setTags]               = useState(entry.tags || []);
   const [tagInput, setTagInput]       = useState("");
+
+  // Auto-open and fetch children when a filter highlights matching children
+  useEffect(() => {
+    if (matchedChildIds.length > 0) {
+      setOpen(true);
+      if (children.length === 0) {
+        setLoadingKids(true);
+        fetch(`${API}/entries/${entry.id}/children`)
+          .then(r => r.json())
+          .then(data => { setChildren(data); setLoadingKids(false); })
+          .catch(() => setLoadingKids(false));
+      }
+    }
+  }, [matchedChildIds.length > 0]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const visibleChildren = hasChildMatches
+    ? children.filter(c => matchedChildIds.includes(c.id))
+    : children;
 
   useEffect(() => {
     setDraftName(entry.name || "");
@@ -844,7 +863,11 @@ function PlaylistCard({ entry, onTagClick, customCats = [], onDelete, onUpdate, 
             </>
           )}
         </div>
-        <span className="text-xs text-gray-600">{children.length || (entry.children?.length ?? "?")} {childLabel}</span>
+        <span className="text-xs text-gray-600">
+          {hasChildMatches
+            ? <><span className="text-accent-green font-bold">{matchedChildIds.length}</span> / {children.length || (entry.children?.length ?? "?")} {childLabel}</>  
+            : `${children.length || (entry.children?.length ?? "?")} ${childLabel}`}
+        </span>
         <span className="text-gray-600 text-xs ml-1">{open ? "▲" : "▼"}</span>
         <button onClick={handleDelete} disabled={deleting}
           className="ml-1 text-gray-700 hover:text-accent-red transition-colors text-xs leading-none"
@@ -902,7 +925,7 @@ function PlaylistCard({ entry, onTagClick, customCats = [], onDelete, onUpdate, 
               <Spinner sm /> Loading {childLabel}…
             </div>
           )}
-          {children.map((child, i) => (
+          {visibleChildren.map((child, i) => (
             <VideoChildItem key={child.id} child={child} index={i}
               onTagClick={onTagClick}
               onRetried={updated => setChildren(prev => prev.map(c => c.id === updated.id ? updated : c))} />
@@ -1993,15 +2016,14 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
   useEffect(() => { fetchEntries(); }, [fetchEntries]);
   useEffect(() => { fetchTags(); },   [fetchTags]);
 
+  // Use allTags (from /tags, includes children) so child-only tags appear in the cloud
   const tagCounts = useMemo(() => {
     const counts = {};
-    for (const entry of entries) {
-      for (const t of entry.tags || []) {
-        counts[t] = (counts[t] || 0) + 1;
-      }
+    for (const { tag, count } of allTags) {
+      counts[tag] = count;
     }
     return counts;
-  }, [entries]);
+  }, [allTags]);
 
   const activeFilters = useMemo(() => {
     const filters = [];
@@ -2434,7 +2456,8 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
                     customCats={customCats}
                     onDelete={id => setEntries(prev => prev.filter(e => e.id !== id))}
                     onUpdate={handleUpdate}
-                    allTags={allTags} />
+                    allTags={allTags}
+                    matchedChildIds={entry.matched_child_ids || []} />
                 : <EntryCard key={entry.id} entry={entry}
                     onToggleRead={toggleRead} onDelete={deleteEntry}
                     onTagClick={t => setActiveTag(prev => prev === t ? "" : t)}

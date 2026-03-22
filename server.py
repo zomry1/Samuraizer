@@ -1531,8 +1531,10 @@ def list_entries():
         query += " AND useful = 1"
 
     if search:
-        query += " AND (url LIKE ? OR name LIKE ? OR bullets LIKE ? OR tags LIKE ?)"
-        params.extend([f"%{search}%"] * 4)
+        query += (" AND (url LIKE ? OR name LIKE ? OR bullets LIKE ? OR tags LIKE ?"
+                  " OR id IN (SELECT parent_id FROM entries WHERE parent_id IS NOT NULL"
+                  " AND (url LIKE ? OR name LIKE ? OR bullets LIKE ? OR tags LIKE ?)))")
+        params.extend([f"%{search}%"] * 8)
 
     query += " ORDER BY created_at DESC"
     rows = db.execute(query, params).fetchall()
@@ -1540,10 +1542,29 @@ def list_entries():
     entry_ids = [r["id"] for r in rows]
     list_map  = _bulk_list_ids(db, entry_ids)
 
+    # Build matched_child_ids so the frontend can auto-open and filter children
+    matched_child_map: dict[int, list[int]] = {}
+    if tag or search:
+        parent_ids = [r["id"] for r in rows if r["category"] in ("playlist", "list", "blog")]
+        if parent_ids:
+            ph  = ",".join("?" * len(parent_ids))
+            cq  = f"SELECT id, parent_id FROM entries WHERE parent_id IN ({ph})"
+            cp  = list(parent_ids)
+            if tag:
+                cq += " AND tags LIKE ?"
+                cp.append(f'%"{tag}"%')
+            if search:
+                cq += " AND (url LIKE ? OR name LIKE ? OR bullets LIKE ? OR tags LIKE ?)"
+                cp.extend([f"%{search}%"] * 4)
+            for c in db.execute(cq, cp).fetchall():
+                matched_child_map.setdefault(c["parent_id"], []).append(c["id"])
+
     result = []
     for r in rows:
         d = _row_to_dict(r)
         d["list_ids"] = list_map.get(r["id"], [])
+        if r["category"] in ("playlist", "list", "blog"):
+            d["matched_child_ids"] = matched_child_map.get(r["id"], [])
         result.append(d)
     return jsonify(result), 200
 
