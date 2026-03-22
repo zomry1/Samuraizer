@@ -108,6 +108,53 @@ flowchart LR
 | LLM       | Gemini 2.5 Flash (Gemini API)          |
 | Frontend  | React 18, Vite, Tailwind CSS           |
 | Bot       | python-telegram-bot v20                |
+| Transcripts | [transcriptapi.com](https://transcriptapi.com) |
+
+---
+
+## 📺 YouTube Transcript Fetching
+
+### Why not `youtube-transcript-api`?
+
+The original implementation used the open-source [`youtube-transcript-api`](https://github.com/jdepoix/youtube-transcript-api) Python library. It works well locally but has a critical limitation in practice: **YouTube aggressively blocks IP addresses** that make automated transcript requests, especially:
+
+- IPs belonging to cloud providers / VPS hosts (AWS, GCP, Azure, Hetzner, etc.)
+- IPs that hit the transcript endpoint too frequently
+
+This meant that after analyzing just a handful of videos, the whole server would get blocked and every subsequent transcript fetch would fail with an `IPBlocked` / `RequestBlocked` error — completely breaking YouTube video analysis.
+
+### Current solution: `transcriptapi.com`
+
+Samuraizer now uses [transcriptapi.com](https://transcriptapi.com) — a third-party paid API that handles the YouTube transcript fetching on their end, routing through infrastructure that isn't blocked.
+
+**Pros:**
+- No IP blocks — they manage the anti-bot problem for you
+- Simple REST API (`GET /api/v2/youtube/transcript`)
+- Free tier available; credits only charged on success (HTTP 200)
+- Retryable error codes (408 / 503) with clear semantics
+
+**Cons:**
+- Not free beyond the free tier (credit-based billing)
+- External dependency — if their service is down, transcript fetching fails
+- Data goes through a third party
+
+**Setup:** Add to `.env`:
+```env
+TRANSCRIPTAPI=your_key_here
+```
+Get a key at [transcriptapi.com/dashboard/api-keys](https://transcriptapi.com/dashboard/api-keys).
+
+### Alternatives worth considering
+
+| Option | How it works | IP block risk | Cost |
+|--------|-------------|--------------|------|
+| **[transcriptapi.com](https://transcriptapi.com)** *(current)* | Managed REST API | None (their problem) | Credit-based |
+| **[yt-dlp](https://github.com/yt-dlp/yt-dlp)** | Downloads subtitles via `--write-sub --skip-download` | Low (mimics browser) | Free, self-hosted |
+| **`youtube-transcript-api` + cookies** | Pass a Netscape cookies.txt from a logged-in browser session | Medium (burner account risk) | Free |
+| **YouTube Data API v3** | Official Google API, no scraping | None | Free quota, then paid |
+| **[Supadata](https://supadata.ai)** | Similar managed REST API | None | Free tier (100 req/day) |
+
+**Best free alternative:** `yt-dlp` — it is actively maintained, mimics real browser requests, and is unlikely to get blocked as quickly as a plain HTTP request. To switch, replace `_fetch_youtube_content` to shell out to `yt-dlp --write-auto-sub --sub-format vtt --skip-download` and parse the resulting `.vtt` file.
 
 ---
 
@@ -121,6 +168,7 @@ GEMINI_API_KEY=your_key_here
 TELEGRAM_BOT_TOKEN=optional
 GITHUB_TOKEN=optional
 SAMURAIZER_URL=http://localhost:8000
+TRANSCRIPTAPI=your_transcriptapi_key_here   # required for YouTube transcript fetching
 ```
 
 ### 2) Install dependencies 📦
