@@ -15,6 +15,7 @@ import logging
 import threading
 import tempfile
 import subprocess
+import collections
 from datetime import datetime
 import requests
 import trafilatura
