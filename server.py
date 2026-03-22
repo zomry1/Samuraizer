@@ -90,10 +90,9 @@ def _ensure_backup_dir():
     os.makedirs(BACKUP_DIR, exist_ok=True)
 
 
-def _make_db_backup(reason: str = "manual"):
-    """Copy the current DB to a timestamped backup file.
-
-    This is run on server startup and periodically (every 12h).
+def _make_db_backup(reason: str = "manual", keep: int = 10):
+    """Copy the current DB to a timestamped backup file, keeping only the
+    most recent *keep* backups (oldest are deleted automatically).
     """
     try:
         _ensure_backup_dir()
@@ -101,6 +100,16 @@ def _make_db_backup(reason: str = "manual"):
         dest = os.path.join(BACKUP_DIR, f"samuraizer_{ts}.db")
         shutil.copy2(DB_PATH, dest)
         logger.info("DB backup saved to %s (%s)", dest, reason)
+        # Prune oldest backups beyond the keep limit
+        backups = sorted(
+            [f for f in os.listdir(BACKUP_DIR) if f.startswith("samuraizer_") and f.endswith(".db")]
+        )
+        for old in backups[:-keep]:
+            try:
+                os.remove(os.path.join(BACKUP_DIR, old))
+                logger.info("DB backup pruned: %s", old)
+            except Exception as prune_exc:
+                logger.warning("Could not prune old backup %s: %s", old, prune_exc)
     except Exception as exc:
         logger.error("DB backup failed (%s): %s", reason, exc)
 
@@ -2637,7 +2646,7 @@ def clear_log_entries():
 # Ensure database exists and is migrated to the latest schema before serving
 init_db()
 
-# Backup on startup and every 12 hours (keep all backups)
+# Backup on startup and every 12 hours (keep last 10 backups)
 # When running with the Flask reloader, only run backups in the reloader child.
 if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
     _make_db_backup("startup")
