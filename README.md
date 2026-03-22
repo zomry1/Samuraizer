@@ -39,11 +39,15 @@ You can interact via:
 - Live progress updates and formatted result cards
 - Works with arbitrary URLs (GitHub repos, blog posts, CVEs, etc.)
 
-### Chat (RAG + streaming)
-- 💬 Ask questions over your knowledge base (GitHub repos, writeups, blog posts)
+### Chat (RAG + streaming + pinned context)
+- 💬 Ask questions over your knowledge base (GitHub repos, writeups, blog posts, PDFs)
 - 🔗 Answers are sourced from the best matching entries (retrieval-augmented generation)
 - ⚡ Streaming responses with live typing and source citations
 - 🗂️ Multiple chat sessions with saved history and model selection
+- 📌 **Pin specific articles** as context — type `@` to get an autocomplete dropdown, or click the `@` browse button to search and select entries
+  - When entries are pinned, Gemini is constrained to answer **only** from those articles (no RAG lookup)
+  - Pinned entries appear as yellow chips above the input; source cards show a 📌 badge instead of a relevance score
+  - Useful for deep-diving into a specific PDF, writeup, or CVE without noise from the rest of the KB
 
 ### API + Developer Features
 - Stream results from `/analyze` as NDJSON for progress updates
@@ -53,6 +57,8 @@ You can interact via:
 - Built-in SQLite persistence in `samuraizer.db`
 - Tag sanitization ensures consistent tagging (lowercase, deduped, normalized)
 - Chat endpoints: `/chat/sessions`, `/chat/sessions/<id>/messages`, `/chat` (streaming RAG)
+- Pinned-context chat: `POST /chat` accepts `pinned_ids: [...]` to bypass RAG and answer exclusively from selected entries
+- Entry autocomplete: `GET /entries/search?q=...` — fuzzy name/URL search, used by the `@` mention feature
 
 ---
 
