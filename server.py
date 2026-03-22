@@ -13,6 +13,7 @@ import sqlite3
 import hashlib
 import logging
 import threading
+import collections
 import requests
 import trafilatura
 import feedparser
@@ -41,6 +42,44 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# In-memory log ring-buffer (exposed via GET /logs)
+# ---------------------------------------------------------------------------
+
+class _MemoryLogHandler(logging.Handler):
+    """Thread-safe ring-buffer that keeps the last 2000 log records."""
+    _MAX = 2000
+
+    def __init__(self):
+        super().__init__(logging.DEBUG)
+        self._lock    = threading.Lock()
+        self._records = collections.deque(maxlen=self._MAX)
+        self._counter = 0
+
+    def emit(self, record: logging.LogRecord):
+        with self._lock:
+            self._counter += 1
+            self._records.append({
+                "id":    self._counter,
+                "ts":    time.strftime("%H:%M:%S", time.localtime(record.created)),
+                "level": record.levelname,
+                "name":  record.name,
+                "msg":   record.getMessage(),
+            })
+
+    def get_since(self, since: int) -> list:
+        with self._lock:
+            return [r for r in self._records if r["id"] > since]
+
+    def clear(self):
+        with self._lock:
+            self._records.clear()
+            self._counter = 0
+
+
+_mem_log = _MemoryLogHandler()
+logging.getLogger().addHandler(_mem_log)
 
 app = Flask(__name__)
 DB_PATH = os.path.join(os.path.dirname(__file__), "samuraizer.db")
@@ -2574,6 +2613,22 @@ def chat():
             sdb.close()
 
     return Response(stream_with_context(generate()), mimetype="application/x-ndjson")
+
+
+# ---------------------------------------------------------------------------
+# Log viewer endpoints
+# ---------------------------------------------------------------------------
+
+@app.route("/logs")
+def get_log_entries():
+    since = request.args.get("since", 0, type=int)
+    return jsonify(_mem_log.get_since(since)), 200
+
+
+@app.route("/logs", methods=["DELETE"])
+def clear_log_entries():
+    _mem_log.clear()
+    return jsonify({"ok": True}), 200
 
 
 # ---------------------------------------------------------------------------
