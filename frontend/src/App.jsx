@@ -2920,20 +2920,26 @@ function LogsTab() {
 
   const LEVELS = ["ALL", "DEBUG", "INFO", "WARNING", "ERROR"];
 
+  // Minimum-level filter: selecting WARNING shows WARNING + ERROR + CRITICAL
+  const LEVEL_ORDER = { DEBUG: 10, INFO: 20, WARNING: 30, ERROR: 40, CRITICAL: 50 };
+
   const counts = useMemo(() => {
     const c = { ALL: logs.length, DEBUG: 0, INFO: 0, WARNING: 0, ERROR: 0 };
     for (const l of logs) {
-      if (l.level === "CRITICAL") { c.ERROR++; c.ALL; }
-      else if (l.level in c) c[l.level]++;
+      const ord = LEVEL_ORDER[l.level] ?? 20;
+      if (ord >= 10) c.DEBUG++;
+      if (ord >= 20) c.INFO++;
+      if (ord >= 30) c.WARNING++;
+      if (ord >= 40) c.ERROR++;
     }
     return c;
   }, [logs]);
 
-  const visible = useMemo(() =>
-    levelFilter === "ALL" ? logs : logs.filter(l =>
-      l.level === levelFilter || (levelFilter === "ERROR" && l.level === "CRITICAL")
-    ),
-  [logs, levelFilter]);
+  const visible = useMemo(() => {
+    if (levelFilter === "ALL") return logs;
+    const min = LEVEL_ORDER[levelFilter] ?? 0;
+    return logs.filter(l => (LEVEL_ORDER[l.level] ?? 20) >= min);
+  }, [logs, levelFilter]);
 
   const activeBtnCls = {
     ALL:     "bg-accent-green/10 text-accent-green border-accent-green/40",
