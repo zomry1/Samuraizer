@@ -1,64 +1,111 @@
-# Samuraizer — Cyber‑Security Insight Engine
+<div align="center">
+  <img src="assets/logo/SamuraizerLogo.png" width="340" alt="Samuraizer"/>
+</div>
+
+# Samuraizer — Cyber‑Security Knowledge Base Engine
+
+<div align="center">
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/) [![React](https://img.shields.io/badge/react-v18-blueviolet)](https://reactjs.org/) [![Gemini](https://img.shields.io/badge/gemini-2.5%20Flash-orange)](https://cloud.google.com/vertex-ai)
 
-Samuraizer ingests URLs (GitHub repos, CVE writeups, blog posts, etc.) **and PDF files**, summarizes them using *Gemini 2.5 Flash*, categorizes/tags them, and stores results in a local SQLite knowledge base.
+**NotebookLM on steroids — purpose-built for security researchers.** 
+</div>
 
-You can interact via:
-- 🌐 **Web UI** (React + Tailwind)
-- 🤖 **Telegram bot** (optional)
+## 💡 Why Samuraizer?
+
+Every security researcher knows the feeling — you find an interesting GitHub repo, a fresh CVE writeup, a blog post about a new exploitation technique. You forward it to yourself on WhatsApp. It immediately drowns in the chat. Weeks later you actually need that article — and it's gone.
+
+***Stop sending yourself links you'll never find again — send them to Samuraizer once, and they're summarized, tagged, and searchable forever.***
+
+<div align="center">
+<table>
+<tr>
+<th>Before 😵</th>
+<th>After 🗡️</th>
+</tr>
+<tr>
+<td align="center"><img src="assets/WhatsappBeforeSamuraizer.jpeg" width="270"/><br/><sub>Scattered links drowning in chat history</sub></td>
+<td align="center"><img src="assets/telegram/TelegramSamuraizerSendingArticle.jpeg" width="270"/><br/><sub>Analyzed, tagged, and ready to be found</sub></td>
+</tr>
+</table>
+</div>
 
 ---
 
 ## 🧩 What you get (at-a-glance)
 
-### Knowledge Base (Web UI)
-- 📝 Add any URL and get a clean summary + tags + category
-- 📄 **Upload PDF files** for analysis — full text extracted and sent to Gemini; PDFs stored in the DB and viewable/downloadable from the card
-- ✏️ Inline tag editing (add/remove tags on entries, feeds, and list items)
-- 🔎 Semantic search (vector search using Gemini embeddings) + classic text search
-- 🧩 Tag cloud + multi-filtering (by tag, category, source, list, read/useful)
-- 📚 List management (groups of entries, RSS lists, manual lists)
-- 👁️‍🗨️ Built-in “hover preview” (summary cards) and quick copy buttons
+### 🔍 Analyze — Paste URLs, watch results stream
+- 📝 Paste one or more URLs (GitHub repos, CVE writeups, blog posts, YouTube videos) — results stream back in real time
+- 📄 **Upload PDF files** directly from the browser or Telegram — full text extracted, analyzed, stored, and viewable in the UI
+- 🗞️ Blog scanner: paste a blog homepage and extract all article links for batch analysis in one click
+- ✨ **Suggested Read**: a relevant unread entry is surfaced on the Analyze tab each session to keep your queue moving
 
-### RSS / Blog Feed Support
-- Add RSS feeds and Samuraizer auto‑polls them periodically
-- New posts are automatically ingested and summarized
-- Each feed becomes its own “list”, making it easy to batch-review
+<div align="center"><img src="assets/screenshoots/AnalyzePage.png" width="700"/></div>
+
+### 🗂️ Knowledge Base
+- ✏️ Inline tag editing (add/remove tags on entries, feeds, and list items)
+- 🔎 Semantic search (vector search via Gemini embeddings) + classic full-text search
+- 🧩 Tag cloud + multi-filtering (by tag, category, source, list, read/useful)
+- 📚 List management — group entries into manual lists, RSS lists, or channel lists
+- 👁️‍🗨️ Hover preview (summary cards) and quick copy buttons
+
+<div align="center"><img src="assets/screenshoots/KnowledgeBasePage.png" width="700"/></div>
+
+### 📡 RSS Feeds & YouTube Subscriptions
+- Add RSS/Atom feeds — the server polls hourly and auto-ingests and summarizes new posts
+- New posts are automatically added to the Knowledge Base
+- Each feed becomes its own list, making it easy to batch-review
 - Feed items show source metadata and can be tagged/filtered like any entry
 
-### YouTube Channel Subscriptions
+### 🎥 YouTube Channel Subscriptions
 - Subscribe to YouTube channels via URL (e.g. https://www.youtube.com/@handle, /channel/UCxxx)
 - Preview latest videos before subscribing and select which videos to analyze
 - On subscribe, selected videos are analyzed immediately; future uploads are auto-polled hourly
 - Runs via `/yt-channels` API and appears in the UI under RSS/YT sections
 
-### Telegram Bot (Optional)
-- Send URLs to the bot, and it will analyze them through the same backend
-- **Send a PDF file** to the bot — it downloads, analyzes, and returns a result card with a link to view the file
-- Live progress updates and formatted result cards
-- Works with arbitrary URLs (GitHub repos, blog posts, CVEs, etc.)
+<div align="center"><img src="assets/screenshoots/SubscriptionsPage.png" width="700"/></div>
 
-### Chat (RAG + streaming + pinned context)
-- 💬 Ask questions over your knowledge base (GitHub repos, writeups, blog posts, PDFs)
-- 🔗 Answers are sourced from the best matching entries (retrieval-augmented generation)
-- ⚡ Streaming responses with live typing and source citations
+### 🗺️ Knowledge Graph
+- Visualize your entire knowledge base as an interactive force-directed graph
+- Entries and tags are nodes — edges show which tags link to which articles
+- Click to preview an entry; double-click to open the original URL
+- Color-coded by category (CVE, article, tool, video, blog, etc.)
+- Search tags to highlight related clusters across the graph
+
+<div align="center"><img src="assets/screenshoots/GraphPage.png" width="700"/></div>
+
+### 🤖 Telegram Bot (Optional)
+- Send any URL to the bot — it analyzes it through the same backend and returns a formatted card
+- **Send a PDF file** — it downloads, analyzes, and returns a result card with a link to view/download the file
+- Live progress updates streamed as the analysis runs
+- Receives a **Suggested Read** notification — the bot proactively surfaces unread entries
+
+<div align="center">
+<table>
+<tr>
+<td align="center"><img src="assets/telegram/TelegramSamuraizerSendingArticle.jpeg" width="260"/><br/><sub><b>Analyzing a URL</b></sub></td>
+<td align="center"><img src="assets/telegram/TelegramSamuraizerSuggestedArticle.jpeg" width="260"/><br/><sub><b>Daily Suggested Read</b></sub></td>
+</tr>
+</table>
+</div>
+
+### 💬 Chat (RAG + streaming + pinned context)
+- Ask questions over your knowledge base — answers are cited from the best matching entries
+- ⚡ Streaming responses with live typing and per-source relevance scores
 - 🗂️ Multiple chat sessions with saved history and model selection
-- 📌 **Pin specific articles** as context — type `@` to get an autocomplete dropdown, or click the `@` browse button to search and select entries
-  - When entries are pinned, Gemini is constrained to answer **only** from those articles (no RAG lookup)
-  - Pinned entries appear as yellow chips above the input; source cards show a 📌 badge instead of a relevance score
-  - Useful for deep-diving into a specific PDF, writeup, or CVE without noise from the rest of the KB
+- 📌 **Pin specific articles** as context — type `@` for autocomplete or use the `@` browse button
+  - When entries are pinned, Gemini answers **only** from those articles — no RAG noise
+  - Pinned entries appear as chips above the input; sources show a 📌 badge instead of a score
+  - Perfect for deep-diving a specific PDF, writeup, or CVE
 
-### API + Developer Features
-- Stream results from `/analyze` as NDJSON for progress updates
-- Upload PDFs via `POST /analyze-pdf` (multipart) — streamed NDJSON, same shape as `/analyze`
-- Retrieve stored PDF bytes via `GET /entries/<id>/pdf` (`?dl=1` for download, default inline)
-- Patch entries via `PATCH /entries/<id>` to update tags, useful state, or read/useful flags
-- Built-in SQLite persistence in `samuraizer.db`
-- Tag sanitization ensures consistent tagging (lowercase, deduped, normalized)
-- Chat endpoints: `/chat/sessions`, `/chat/sessions/<id>/messages`, `/chat` (streaming RAG)
-- Pinned-context chat: `POST /chat` accepts `pinned_ids: [...]` to bypass RAG and answer exclusively from selected entries
-- Entry autocomplete: `GET /entries/search?q=...` — fuzzy name/URL search, used by the `@` mention feature
+<div align="center">
+<table>
+<tr>
+<td align="center"><img src="assets/screenshoots/ChatPage.png" width="440"/><br/><sub><b>RAG chat with source scores</b></sub></td>
+<td align="center"><img src="assets/screenshoots/ChatPage(PinnedItem).png" width="440"/><br/><sub><b>Pinned-context chat</b></sub></td>
+</tr>
+</table>
+</div>
 
 ---
 
@@ -74,18 +121,6 @@ flowchart LR
   Backend -->|RSS| RSS[RSS feeds]
   Telegram[Telegram Bot] -->|HTTP| Backend
 ```
-
----
-
-## 📸 Screenshots (placeholders)
-
-### Web UI — Knowledge Base
-![KB view placeholder](docs/screenshots/kb.png)
-*Replace with a screenshot of the main knowledge base view.*
-
-### Telegram bot (optional)
-![Telegram bot placeholder](docs/screenshots/telegram.png)
-*Replace with a screenshot of the bot responding to a URL.*
 
 ---
 
@@ -116,9 +151,57 @@ flowchart LR
 | Bot       | python-telegram-bot v20                |
 | Transcripts | [transcriptapi.com](https://transcriptapi.com) |
 
+
 ---
 
-## 📺 YouTube Transcript Fetching
+## ⚙️ Setup (Local)
+
+### 1) Config 🔐
+Copy `.env.example` to `.env` and fill in your keys:
+
+```bash
+cp .env.example .env
+```
+
+| Variable | Required | Where to get it |
+|---|---|---|
+| `GEMINI_API_KEY` | ✅ Yes | [Google AI Studio → Get API key](https://aistudio.google.com/app/apikey) |
+| `TELEGRAM_BOT_TOKEN` | No | [Create a bot with @BotFather on Telegram](https://t.me/BotFather) |
+| `GITHUB_TOKEN` | No | [GitHub → Settings → Developer settings → Personal access tokens](https://github.com/settings/tokens) — raises API rate limit from 60 to 5,000 req/hr |
+| `TRANSCRIPTAPI` | No | [transcriptapi.com/dashboard/api-keys](https://transcriptapi.com/dashboard/api-keys) — required for YouTube transcript fetching |
+| `SAMURAIZER_URL` | No | URL of your backend (default: `http://localhost:8000`), used by the Telegram bot |
+
+### 2) Install dependencies 📦
+
+```bash
+pip install -r requirements.txt
+cd frontend && npm install
+```
+
+### 3) Run backend ▶️
+
+```bash
+python server.py
+```
+
+### 4) Run frontend 🌐
+
+```bash
+cd frontend
+npm run dev
+```
+
+### 5) (Optional) Run Telegram bot 🤖
+
+```bash
+python telegram_bot.py
+```
+
+---
+
+
+<details>
+<summary>📺 YouTube Transcript Fetching</summary>
 
 ### Why not `youtube-transcript-api`?
 
@@ -162,50 +245,10 @@ Get a key at [transcriptapi.com/dashboard/api-keys](https://transcriptapi.com/da
 
 **Best free alternative:** `yt-dlp` — it is actively maintained, mimics real browser requests, and is unlikely to get blocked as quickly as a plain HTTP request. To switch, replace `_fetch_youtube_content` to shell out to `yt-dlp --write-auto-sub --sub-format vtt --skip-download` and parse the resulting `.vtt` file.
 
----
+</details>
 
-## ⚙️ Setup (Local)
-
-### 1) Config 🔐
-Create a `.env` in the project root:
-
-```env
-GEMINI_API_KEY=your_key_here
-TELEGRAM_BOT_TOKEN=optional
-GITHUB_TOKEN=optional
-SAMURAIZER_URL=http://localhost:8000
-TRANSCRIPTAPI=your_transcriptapi_key_here   # required for YouTube transcript fetching
-```
-
-### 2) Install dependencies 📦
-
-```bash
-pip install -r requirements.txt
-cd frontend && npm install
-```
-
-### 3) Run backend ▶️
-
-```bash
-python server.py
-```
-
-### 4) Run frontend 🌐
-
-```bash
-cd frontend
-npm run dev
-```
-
-### 5) (Optional) Run Telegram bot 🤖
-
-```bash
-python telegram_bot.py
-```
-
----
-
-## 📦 API Endpoints
+<details>
+<summary>📦 API Endpoints</summary>
 
 ### Analyze a URL
 `POST /analyze`
@@ -238,16 +281,7 @@ Streams NDJSON events in the same shape as `/analyze` (using the filename as the
 ### Manage tags
 - Tag edits happen via `PATCH /entries/<id>` with JSON `{ "tags": ["tag1","tag2"] }`
 
----
-
-## 🧠 Notes
-
-- The `functions/` directory and `firebase.json` are legacy and not used.
-- The knowledge base uses `source` values: `manual`, `rss`, and `pdf`.
-- PDF files are stored as BLOBs in the `entries.pdf_data` column and deduplicated by SHA-256 hash.
-- Tags are sanitized (lowercased, de-duped) before storing.
-- Embeddings use **gemini-embedding-2-preview** and are stored in chunked form (`entry_chunks` table) so the full article can be searched.
-- Run **Embed all entries** after initial setup or when updating the embedding model.
+</details>
 
 ---
 
