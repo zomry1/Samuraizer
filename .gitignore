@@ -29,3 +29,7 @@ Thumbs.db
 samuraizer.db
 samuraizer.log
 /db_backups/
+
+# Claude / Copilot IDE internal files
+.claude/
+CLAUDE.md
