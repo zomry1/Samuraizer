@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="assets/logo/SamuraizerLogo.png" width="340" alt="Samuraizer"/>
+  <img src="assets/logo/SamuraizerLogoNoBackground.png" width="340" alt="Samuraizer"/>
 </div>
 
 # Samuraizer — Cyber‑Security Knowledge Base Engine
