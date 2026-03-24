@@ -143,14 +143,13 @@ flowchart LR
 
 ## 🧰 Tech Stack
 
-![Python](https://img.shields.io/badge/python-3776AB?style=for-the-badge&logo=python&logoColor=white)
-![Flask](https://img.shields.io/badge/flask-%23000.svg?style=for-the-badge&logo=flask&logoColor=white)
-![SQLite](https://img.shields.io/badge/sqlite-%2307405e.svg?style=for-the-badge&logo=sqlite&logoColor=white)
-![React](https://img.shields.io/badge/react-%2320232a.svg?style=for-the-badge&logo=react&logoColor=%2361DAFB)
-![Vite](https://img.shields.io/badge/vite-%23646CFF.svg?style=for-the-badge&logo=vite&logoColor=white)
-![TailwindCSS](https://img.shields.io/badge/tailwindcss-%2338B2AC.svg?style=for-the-badge&logo=tailwind-css&logoColor=white)
-![Google Gemini](https://img.shields.io/badge/Gemini%202.5%20Flash-8E75B2?style=for-the-badge&logo=google%20gemini&logoColor=white)
-![Telegram](https://img.shields.io/badge/python--telegram--bot-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)
+| Layer     | Tech / Libraries                      |
+|-----------|----------------------------------------|
+| Backend   | Python, Flask, SQLite, feedparser, PyMuPDF |
+| LLM       | Gemini 2.5 Flash (Gemini API)          |
+| Frontend  | React 18, Vite, Tailwind CSS           |
+| Bot       | python-telegram-bot v20                |
+| Transcripts | [transcriptapi.com](https://transcriptapi.com) |
 
 
 ---
