@@ -6,7 +6,7 @@
 
 <div align="center">
 
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/) [![React](https://img.shields.io/badge/react-v18-blueviolet)](https://reactjs.org/) [![Gemini](https://img.shields.io/badge/gemini-2.5%20Flash-orange)](https://cloud.google.com/vertex-ai)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/) [![React](https://img.shields.io/badge/react-v18-blueviolet)](https://reactjs.org/) [![Gemini](https://img.shields.io/badge/gemini-2.5%20Flash-orange)](https://cloud.google.com/vertex-ai) ![Built For](https://img.shields.io/badge/Built%20For-Security%20Researchers-red?style=flat-square) ![GitHub last commit](https://img.shields.io/github/last-commit/zomry1/Samuraizer?style=flat-square)
 
 **NotebookLM on steroids — purpose-built for security researchers.** 
 </div>
@@ -25,7 +25,7 @@ Every security researcher knows the feeling — you find an interesting GitHub r
 </tr>
 <tr>
 <td align="center"><img src="assets/WhatsappBeforeSamuraizer.jpeg" width="270"/><br/><sub>Scattered links drowning in chat history</sub></td>
-<td align="center"><img src="assets/telegram/TelegramSamuraizerSendingArticle.jpeg" width="270"/><br/><sub>Analyzed, tagged, and ready to be found</sub></td>
+<td align="center"><img src="assets/gifs/TelegramVideo.gif" width="270"/><br/><sub>Analyzed, tagged, and ready to be found</sub></td>
 </tr>
 </table>
 </div>
@@ -40,7 +40,7 @@ Every security researcher knows the feeling — you find an interesting GitHub r
 - 🗞️ Blog scanner: paste a blog homepage and extract all article links for batch analysis in one click
 - ✨ **Suggested Read**: a relevant unread entry is surfaced on the Analyze tab each session to keep your queue moving
 
-<div align="center"><img src="assets/screenshoots/AnalyzePage.png" width="700"/></div>
+<div align="center"><img src="assets/screenshots/AnalyzePage.png" width="700"/></div>
 
 ### 🗂️ Knowledge Base
 - ✏️ Inline tag editing (add/remove tags on entries, feeds, and list items)
@@ -49,7 +49,16 @@ Every security researcher knows the feeling — you find an interesting GitHub r
 - 📚 List management — group entries into manual lists, RSS lists, or channel lists
 - 👁️‍🗨️ Hover preview (summary cards) and quick copy buttons
 
-<div align="center"><img src="assets/screenshoots/KnowledgeBasePage.png" width="700"/></div>
+<div align="center"><img src="assets/screenshots/KnowledgeBasePage.png" width="700"/></div>
+
+### 🗺️ Knowledge Graph
+- Visualize your entire knowledge base as an interactive force-directed graph
+- Entries and tags are nodes — edges show which tags link to which articles
+- Click to preview an entry; double-click to open the original URL
+- Color-coded by category (CVE, article, tool, video, blog, etc.)
+- Search tags to highlight related clusters across the graph
+
+<div align="center"><img src="assets/gifs/SamuraizerGraphGif.gif" width="700"/></div>
 
 ### 📡 RSS Feeds & YouTube Subscriptions
 - Add RSS/Atom feeds — the server polls hourly and auto-ingests and summarizes new posts
@@ -63,16 +72,7 @@ Every security researcher knows the feeling — you find an interesting GitHub r
 - On subscribe, selected videos are analyzed immediately; future uploads are auto-polled hourly
 - Runs via `/yt-channels` API and appears in the UI under RSS/YT sections
 
-<div align="center"><img src="assets/screenshoots/SubscriptionsPage.png" width="700"/></div>
-
-### 🗺️ Knowledge Graph
-- Visualize your entire knowledge base as an interactive force-directed graph
-- Entries and tags are nodes — edges show which tags link to which articles
-- Click to preview an entry; double-click to open the original URL
-- Color-coded by category (CVE, article, tool, video, blog, etc.)
-- Search tags to highlight related clusters across the graph
-
-<div align="center"><img src="assets/screenshoots/GraphPage.png" width="700"/></div>
+<div align="center"><img src="assets/screenshots/SubscriptionsPage.png" width="700"/></div>
 
 ### 🤖 Telegram Bot (Optional)
 - Send any URL to the bot — it analyzes it through the same backend and returns a formatted card
@@ -101,8 +101,8 @@ Every security researcher knows the feeling — you find an interesting GitHub r
 <div align="center">
 <table>
 <tr>
-<td align="center"><img src="assets/screenshoots/ChatPage.png" width="440"/><br/><sub><b>RAG chat with source scores</b></sub></td>
-<td align="center"><img src="assets/screenshoots/ChatPage(PinnedItem).png" width="440"/><br/><sub><b>Pinned-context chat</b></sub></td>
+<td align="center"><img src="assets/screenshots/ChatPage.png" width="440"/><br/><sub><b>RAG chat with source scores</b></sub></td>
+<td align="center"><img src="assets/screenshots/ChatPage(PinnedItem).png" width="440"/><br/><sub><b>Pinned-context chat</b></sub></td>
 </tr>
 </table>
 </div>
@@ -143,13 +143,14 @@ flowchart LR
 
 ## 🧰 Tech Stack
 
-| Layer     | Tech / Libraries                      |
-|-----------|----------------------------------------|
-| Backend   | Python, Flask, SQLite, feedparser, PyMuPDF |
-| LLM       | Gemini 2.5 Flash (Gemini API)          |
-| Frontend  | React 18, Vite, Tailwind CSS           |
-| Bot       | python-telegram-bot v20                |
-| Transcripts | [transcriptapi.com](https://transcriptapi.com) |
+![Python](https://img.shields.io/badge/python-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![Flask](https://img.shields.io/badge/flask-%23000.svg?style=for-the-badge&logo=flask&logoColor=white)
+![SQLite](https://img.shields.io/badge/sqlite-%2307405e.svg?style=for-the-badge&logo=sqlite&logoColor=white)
+![React](https://img.shields.io/badge/react-%2320232a.svg?style=for-the-badge&logo=react&logoColor=%2361DAFB)
+![Vite](https://img.shields.io/badge/vite-%23646CFF.svg?style=for-the-badge&logo=vite&logoColor=white)
+![TailwindCSS](https://img.shields.io/badge/tailwindcss-%2338B2AC.svg?style=for-the-badge&logo=tailwind-css&logoColor=white)
+![Google Gemini](https://img.shields.io/badge/Gemini%202.5%20Flash-8E75B2?style=for-the-badge&logo=google%20gemini&logoColor=white)
+![Telegram](https://img.shields.io/badge/python--telegram--bot-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)
 
 
 ---
@@ -174,6 +175,10 @@ cp .env.example .env
 ### 2) Install dependencies 📦
 
 ```bash
+# Create and activate a virtual environment
+python -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+
 pip install -r requirements.txt
 cd frontend && npm install
 ```
