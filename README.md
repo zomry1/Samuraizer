@@ -107,6 +107,10 @@ Every security researcher knows the feeling — you find an interesting GitHub r
 </table>
 </div>
 
+> [!IMPORTANT]
+> **Shape the Future of Samuraizer!** We are currently voting on new features like Local LLMs and Obsidian export.
+[**Cast your vote here!**](https://github.com/zomry1/Samuraizer/discussions/7)
+
 ---
 
 ## 🏗 Architecture (high-level)
