@@ -940,7 +940,7 @@ function ProgressItem({ item, lists, onAddToList, onRemoveFromList, onUpdate, cu
   const [logsOpen, setLogsOpen] = useState(true);
 
   if (item.status === "ok") {
-    const card = ["playlist", "list", "blog"].includes(item.entry?.category)
+    const card = ["playlist", "blog"].includes(item.entry?.category)
       ? <PlaylistCard entry={item.entry} customCats={customCats} onUpdate={onUpdate} />
       : <EntryCard entry={item.entry} onToggleRead={() => {}} onDelete={() => {}}
           lists={lists} onAddToList={onAddToList} onRemoveFromList={onRemoveFromList} onUpdate={onUpdate} customCats={customCats} />;
@@ -1686,13 +1686,13 @@ function GraphTab() {
       {selected && (
         <div className="absolute bottom-4 left-4 right-4 sm:right-auto sm:w-80 bg-surface-1 border border-accent-blue/40 rounded-lg p-3 text-xs shadow-xl"
           style={{ zIndex: 10 }}>
-          <div className="flex items-center justify-between mb-2">
-            <div className="flex items-center gap-2">
+          <div className="flex items-start justify-between mb-2">
+            <div className="flex items-start gap-2 flex-1 min-w-0 mr-2">
               <Badge category={selected.category} />
-              <span className="text-gray-200 font-semibold truncate">{selected.name}</span>
+              <span className="text-gray-200 font-semibold break-words min-w-0">{selected.name}</span>
             </div>
             <button onClick={() => { selectedRef.current = null; setSelected(null); }}
-              className="text-gray-600 hover:text-gray-400 ml-2 flex-shrink-0">✕</button>
+              className="text-gray-600 hover:text-gray-400 flex-shrink-0">✕</button>
           </div>
           <ul className="space-y-1 mb-2">
             {selected.bullets.map((b, i) => (
@@ -2450,7 +2450,7 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
               </div>
             )}
             {entries.map(entry => (
-              ["playlist", "list", "blog"].includes(entry.category)
+              ["playlist", "blog"].includes(entry.category)
                 ? <PlaylistCard key={entry.id} entry={entry}
                     onTagClick={t => setActiveTag(prev => prev === t ? "" : t)}
                     customCats={customCats}
