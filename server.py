@@ -1304,7 +1304,7 @@ def _bulk_list_ids(db, entry_ids: list[int]) -> dict[int, list[int]]:
         return {}
     placeholders = ",".join("?" * len(entry_ids))
     rows = db.execute(
-        f"SELECT entry_id, list_id FROM list_entries WHERE entry_id IN ({placeholders})",
+        f"SELECT entry_id, list_id FROM list_entries WHERE entry_id IN ({placeholders})",  # nosec B608 – placeholders are only '?' chars, not user data
         entry_ids,
     ).fetchall()
     result: dict[int, list[int]] = {eid: [] for eid in entry_ids}
@@ -1644,7 +1644,7 @@ def list_entries():
         parent_ids = [r["id"] for r in rows if r["category"] in ("playlist", "list", "blog")]
         if parent_ids:
             ph  = ",".join("?" * len(parent_ids))
-            cq  = f"SELECT id, parent_id FROM entries WHERE parent_id IN ({ph})"
+            cq  = f"SELECT id, parent_id FROM entries WHERE parent_id IN ({ph})"  # nosec B608 – ph contains only '?' placeholders
             cp  = list(parent_ids)
             if tag:
                 cq += " AND tags LIKE ?"
@@ -1708,8 +1708,11 @@ def update_entry(entry_id):
         updates["tags"] = json.dumps(tags)
     if not updates:
         return jsonify({"error": "Nothing to update"}), 400
-    set_clause = ", ".join(f"{k} = ?" for k in updates)
-    db.execute(f"UPDATE entries SET {set_clause} WHERE id = ?", [*updates.values(), entry_id])
+    _ALLOWED_PATCH_COLS = {"name", "category", "useful", "tags", "read"}
+    if not all(k in _ALLOWED_PATCH_COLS for k in updates):
+        return jsonify({"error": "Invalid field in update"}), 400
+    set_clause = ", ".join(f"{k} = ?" for k in updates)  # nosec B608 – keys validated against allowlist above
+    db.execute(f"UPDATE entries SET {set_clause} WHERE id = ?", [*updates.values(), entry_id])  # nosec B608
     db.commit()
     row = db.execute("SELECT * FROM entries WHERE id = ?", (entry_id,)).fetchone()
     return jsonify(_row_to_dict(row, db)), 200
@@ -1862,7 +1865,7 @@ def semantic_search():
     top_ids   = [eid for eid, _ in top_pairs]
     score_map = {eid: s for eid, s in top_pairs}
     ph        = ",".join("?" * len(top_ids))
-    rows      = db.execute(f"SELECT * FROM entries WHERE id IN ({ph})", top_ids).fetchall()
+    rows      = db.execute(f"SELECT * FROM entries WHERE id IN ({ph})", top_ids).fetchall()  # nosec B608 – ph contains only '?' placeholders
     entry_map = {r["id"]: r for r in rows}
     list_map  = _bulk_list_ids(db, top_ids)
 
@@ -2587,7 +2590,7 @@ def chat():
                 # ── Pinned-entry mode: skip RAG, use caller-selected entries ──
                 ph         = ",".join("?" * len(pinned_ids))
                 entry_rows = sdb.execute(
-                    f"SELECT * FROM entries WHERE id IN ({ph})", pinned_ids
+                    f"SELECT * FROM entries WHERE id IN ({ph})", pinned_ids  # nosec B608 – ph contains only '?' placeholders
                 ).fetchall()
                 for row in entry_rows:
                     # Pull ALL chunks ordered by index to reconstruct the full content
@@ -2633,7 +2636,7 @@ def chat():
                 if top_entries:
                     top_ids    = [eid for eid, _, _ in top_entries]
                     ph         = ",".join("?" * len(top_ids))
-                    entry_rows = sdb.execute(f"SELECT * FROM entries WHERE id IN ({ph})", top_ids).fetchall()
+                    entry_rows = sdb.execute(f"SELECT * FROM entries WHERE id IN ({ph})", top_ids).fetchall()  # nosec B608 – ph contains only '?' placeholders
                     entry_map  = {r["id"]: r for r in entry_rows}
                     for eid, score, chunk_text in top_entries:
                         row = entry_map.get(eid)
@@ -2742,11 +2745,13 @@ def clear_log_entries():
 # Ensure database exists and is migrated to the latest schema before serving
 init_db()
 
+_debug = os.getenv("FLASK_DEBUG", "false").lower() == "true"
+
 # Backup on startup and every 12 hours (keep last 10 backups)
 # When running with the Flask reloader, only run backups in the reloader child.
-if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+if not _debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
     _make_db_backup("startup")
     _start_backup_scheduler(12)
 
 _start_rss_scheduler()
-app.run(port=8000, debug=True, use_reloader=True)
+app.run(port=8000, debug=_debug, use_reloader=_debug)
