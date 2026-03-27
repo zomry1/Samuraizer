@@ -4,7 +4,7 @@
     {
       "label": "Start Backend Server",
       "type": "shell",
-      "command": "powershell -Command \".\\.venv\\Scripts\\Activate.ps1; python server.py\"",
+      "command": ".\\.venv\\Scripts\\python.exe server.py",
       "group": {
         "kind": "build",
         "isDefault": false
@@ -17,7 +17,7 @@
     {
       "label": "Start Telegram Bot",
       "type": "shell",
-      "command": "powershell -Command \".\\.venv\\Scripts\\Activate.ps1; python telegram_bot.py\"",
+      "command": ".\\.venv\\Scripts\\python.exe telegram_bot.py",
       "group": {
         "kind": "build",
         "isDefault": false

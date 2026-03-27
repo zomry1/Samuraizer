@@ -8,17 +8,23 @@ import re
 import json
 import math
 import time
+import shutil
 import sqlite3
+import hashlib
 import logging
+import threading
+import collections
 import requests
 import trafilatura
+import feedparser
+import json_repair
 from urllib.parse import urlparse, urljoin
+import fitz  # PyMuPDF
 from scrapling import Fetcher as ScraplingFetcher
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 from google import genai
 from google.genai import types as genai_types
 
-from flask import Flask, request, jsonify, g
+from flask import Flask, request, jsonify, g, Response, stream_with_context
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -37,8 +43,85 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# In-memory log ring-buffer (exposed via GET /logs)
+# ---------------------------------------------------------------------------
+
+class _MemoryLogHandler(logging.Handler):
+    """Thread-safe ring-buffer that keeps the last 2000 log records."""
+    _MAX = 2000
+
+    def __init__(self):
+        super().__init__(logging.DEBUG)
+        self._lock    = threading.Lock()
+        self._records = collections.deque(maxlen=self._MAX)
+        self._counter = 0
+
+    def emit(self, record: logging.LogRecord):
+        with self._lock:
+            self._counter += 1
+            self._records.append({
+                "id":    self._counter,
+                "ts":    time.strftime("%H:%M:%S", time.localtime(record.created)),
+                "level": record.levelname,
+                "name":  record.name,
+                "msg":   record.getMessage(),
+            })
+
+    def get_since(self, since: int) -> list:
+        with self._lock:
+            return [r for r in self._records if r["id"] > since]
+
+    def clear(self):
+        with self._lock:
+            self._records.clear()
+            self._counter = 0
+
+
+_mem_log = _MemoryLogHandler()
+logging.getLogger().addHandler(_mem_log)
+
 app = Flask(__name__)
 DB_PATH = os.path.join(os.path.dirname(__file__), "samuraizer.db")
+BACKUP_DIR = os.path.join(os.path.dirname(__file__), "db_backups")
+
+
+def _ensure_backup_dir():
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+
+
+def _make_db_backup(reason: str = "manual", keep: int = 10):
+    """Copy the current DB to a timestamped backup file, keeping only the
+    most recent *keep* backups (oldest are deleted automatically).
+    """
+    try:
+        _ensure_backup_dir()
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        dest = os.path.join(BACKUP_DIR, f"samuraizer_{ts}.db")
+        shutil.copy2(DB_PATH, dest)
+        logger.info("DB backup saved to %s (%s)", dest, reason)
+        # Prune oldest backups beyond the keep limit
+        backups = sorted(
+            [f for f in os.listdir(BACKUP_DIR) if f.startswith("samuraizer_") and f.endswith(".db")]
+        )
+        for old in backups[:-keep]:
+            try:
+                os.remove(os.path.join(BACKUP_DIR, old))
+                logger.info("DB backup pruned: %s", old)
+            except Exception as prune_exc:
+                logger.warning("Could not prune old backup %s: %s", old, prune_exc)
+    except Exception as exc:
+        logger.error("DB backup failed (%s): %s", reason, exc)
+
+
+def _start_backup_scheduler(interval_hours: int = 12):
+    def loop():
+        while True:
+            time.sleep(interval_hours * 3600)
+            _make_db_backup("interval")
+
+    t = threading.Thread(target=loop, daemon=True)
+    t.start()
 
 # ---------------------------------------------------------------------------
 # Database
@@ -108,6 +191,75 @@ def init_db():
             db.execute("ALTER TABLE entries ADD COLUMN useful INTEGER DEFAULT 0")
         if "parent_id" not in cols:
             db.execute("ALTER TABLE entries ADD COLUMN parent_id INTEGER DEFAULT NULL")
+        if "source" not in cols:
+            db.execute("ALTER TABLE entries ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")
+        if "pdf_data" not in cols:
+            db.execute("ALTER TABLE entries ADD COLUMN pdf_data BLOB DEFAULT NULL")
+        # RSS feeds table
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS rss_feeds (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                url           TEXT    UNIQUE NOT NULL,
+                name          TEXT    NOT NULL DEFAULT '',
+                last_checked  TEXT    DEFAULT NULL,
+                created_at    TEXT    DEFAULT (datetime('now'))
+            )
+        """)
+        # YouTube channel subscriptions table
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS yt_channels (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id    TEXT    UNIQUE NOT NULL,
+                channel_url   TEXT    NOT NULL DEFAULT '',
+                name          TEXT    NOT NULL DEFAULT '',
+                last_checked  TEXT    DEFAULT NULL,
+                created_at    TEXT    DEFAULT (datetime('now'))
+            )
+        """)
+        # Chunked embeddings table (replaces entries.embedding for search)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS entry_chunks (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry_id    INTEGER NOT NULL,
+                chunk_index INTEGER NOT NULL DEFAULT 0,
+                chunk_text  TEXT    NOT NULL DEFAULT '',
+                embedding   TEXT    NOT NULL DEFAULT '',
+                FOREIGN KEY (entry_id) REFERENCES entries(id) ON DELETE CASCADE
+            )
+        """)
+        # Chat sessions
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS chat_sessions (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                title      TEXT    DEFAULT NULL,
+                model      TEXT    NOT NULL DEFAULT 'gemini-2.5-flash',
+                created_at TEXT    DEFAULT (datetime('now')),
+                updated_at TEXT    DEFAULT (datetime('now'))
+            )
+        """)
+        # Chat messages
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL,
+                role       TEXT    NOT NULL,
+                text       TEXT    NOT NULL DEFAULT '',
+                sources    TEXT    NOT NULL DEFAULT '[]',
+                created_at TEXT    DEFAULT (datetime('now')),
+                FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
+            )
+        """)
+        # Migration: wipe old embeddings if dimensions don't match new model (768 → 3072)
+        sample = db.execute("SELECT embedding FROM entries WHERE embedding != '' LIMIT 1").fetchone()
+        if sample:
+            try:
+                old_emb = json.loads(sample["embedding"])
+                if len(old_emb) != 3072:
+                    logger.info("Embedding dimensions changed (%d → 3072), wiping old embeddings…", len(old_emb))
+                    db.execute("UPDATE entries SET embedding = ''")
+                    db.execute("DELETE FROM entry_chunks")
+            except Exception:
+                pass
         db.commit()
 
 
@@ -240,11 +392,24 @@ def _build_system_prompt(custom_cats: list) -> str:
 # ---------------------------------------------------------------------------
 # Embeddings
 # ---------------------------------------------------------------------------
-_EMBED_MODEL = "gemini-embedding-001"
+_EMBED_MODEL = "gemini-embedding-2-preview"
+
+_CHUNK_SIZE    = 6000   # chars per chunk
+_CHUNK_OVERLAP = 300    # overlap between consecutive chunks
 
 
-def _entry_embed_text(name: str, bullets: list, tags: list) -> str:
-    return f"{name}. {' '.join(bullets)}. {' '.join(tags)}"
+def _chunk_text(text: str) -> list[str]:
+    """Split text into overlapping chunks of ~_CHUNK_SIZE chars."""
+    if not text:
+        return []
+    chunks, start = [], 0
+    while start < len(text):
+        end = start + _CHUNK_SIZE
+        chunks.append(text[start:end])
+        if end >= len(text):
+            break
+        start = end - _CHUNK_OVERLAP
+    return chunks
 
 
 def _get_embedding(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> list:
@@ -256,10 +421,31 @@ def _get_embedding(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> list:
     return list(result.embeddings[0].values)
 
 
-def _store_entry_embedding(db, entry_id: int, name: str, bullets: list, tags: list) -> None:
-    text = _entry_embed_text(name or "", bullets or [], tags or [])
-    emb = _get_embedding(text)
-    db.execute("UPDATE entries SET embedding = ? WHERE id = ?", (json.dumps(emb), entry_id))
+def _store_entry_embedding(db, entry_id: int, name: str, bullets: list, tags: list,
+                           content: str = "") -> None:
+    """Chunk the entry content, embed each chunk, and store in entry_chunks."""
+    header = f"{name}. {' '.join(bullets or [])}. {' '.join(tags or [])}."
+    db.execute("DELETE FROM entry_chunks WHERE entry_id = ?", (entry_id,))
+
+    text_chunks = _chunk_text(content.strip()) if content and content.strip() else []
+
+    if text_chunks:
+        for i, chunk in enumerate(text_chunks):
+            # Prepend header so every chunk has contextual identity
+            full_text = f"{header}\n{chunk}"[:8000]
+            emb = _get_embedding(full_text)
+            db.execute(
+                "INSERT INTO entry_chunks (entry_id, chunk_index, chunk_text, embedding) VALUES (?,?,?,?)",
+                (entry_id, i, chunk[:3000], json.dumps(emb)),
+            )
+    else:
+        emb = _get_embedding(header)
+        db.execute(
+            "INSERT INTO entry_chunks (entry_id, chunk_index, chunk_text, embedding) VALUES (?,?,?,?)",
+            (entry_id, 0, header, json.dumps(emb)),
+        )
+
+    db.execute("UPDATE entries SET embedding = '' WHERE id = ?", (entry_id,))
     db.commit()
 
 
@@ -369,18 +555,52 @@ def _fetch_youtube_content(url: str) -> tuple[str, list[str]]:
     except Exception as exc:
         logs.append(f"oEmbed fetch failed (non-fatal): {exc}")
 
-    # Fetch transcript
-    try:
-        api = YouTubeTranscriptApi()
-        fetched = api.fetch(video_id)
-        transcript_text = " ".join(snippet.text for snippet in fetched)
-        logs.append(f"Transcript fetched ({len(transcript_text):,} chars, {len(fetched)} segments)")
-    except TranscriptsDisabled:
-        raise RuntimeError("This video has transcripts/captions disabled")
-    except NoTranscriptFound:
-        raise RuntimeError("No transcript found for this video (try a video with captions enabled)")
-    except Exception as exc:
-        raise RuntimeError(f"Failed to fetch transcript: {exc}")
+    # Fetch transcript via transcriptapi.com (retries on 408/429/503)
+    transcript_api_key = os.getenv("TRANSCRIPTAPI", "").strip()
+    if not transcript_api_key:
+        raise RuntimeError("TRANSCRIPTAPI key not set in .env")
+
+    headers = {"Authorization": f"Bearer {transcript_api_key}"}
+    transcript_text = None
+    last_error = None
+    for attempt in range(3):
+        try:
+            tr = requests.get(
+                "https://transcriptapi.com/api/v2/youtube/transcript",
+                params={"video_url": video_id, "format": "text", "include_timestamp": "false"},
+                headers=headers,
+                timeout=30,
+            )
+            if tr.status_code == 200:
+                data = tr.json()
+                transcript_text = data.get("transcript", "")
+                logs.append(f"Transcript fetched ({len(transcript_text):,} chars)")
+                break
+            elif tr.status_code in (408, 503):
+                wait = 2 ** attempt
+                logs.append(f"Transcript API returned {tr.status_code}, retrying in {wait}s…")
+                time.sleep(wait)
+                last_error = f"HTTP {tr.status_code}"
+            elif tr.status_code == 429:
+                retry_after = int(tr.headers.get("Retry-After", 5))
+                logs.append(f"Transcript API rate-limited, retrying in {retry_after}s…")
+                time.sleep(retry_after)
+                last_error = "rate limited"
+            elif tr.status_code == 404:
+                raise RuntimeError("No transcript available for this video")
+            elif tr.status_code == 402:
+                raise RuntimeError("Transcript API credits exhausted — top up at transcriptapi.com")
+            elif tr.status_code == 401:
+                raise RuntimeError("TRANSCRIPTAPI key is invalid")
+            else:
+                raise RuntimeError(f"Transcript API error: HTTP {tr.status_code} — {tr.text[:200]}")
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"Transcript API request failed: {exc}")
+
+    if not transcript_text:
+        raise RuntimeError(f"Failed to fetch transcript after 3 attempts ({last_error})")
 
     content = f"# {title}\n\nYouTube URL: {url}\n\n## Transcript\n\n{transcript_text}"
     logs.append(f"Total content size: {len(content):,} chars")
@@ -426,12 +646,14 @@ def _call_gemini(content: str, custom_cats: list = []) -> tuple[dict, list[str]]
     if not _API_KEY:
         raise EnvironmentError("GEMINI_API_KEY not set in .env")
 
-    if len(content) > 60_000:
-        logs.append(f"Content truncated from {len(content):,} to 60,000 chars")
-        content = content[:60_000] + "\n\n[... truncated ...]"
-
     logs.append(f"Sending {len(content):,} chars to {_MODEL_NAME}...")
     t0 = time.time()
+
+    # Strip ASCII control characters (except tab/newline) that can corrupt Gemini's JSON output
+    content = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", content)
+    # Hard cap at 120k chars to stay well within the model's practical JSON output limit
+    if len(content) > 120_000:
+        content = content[:120_000] + "\n\n[content truncated]"
 
     response = _genai_client.models.generate_content(
         model=_MODEL_NAME,
@@ -469,7 +691,15 @@ def _call_gemini(content: str, custom_cats: list = []) -> tuple[dict, list[str]]
                 break
     raw = raw[start:end + 1]
 
-    parsed   = json.loads(raw)
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        # Gemini occasionally emits slightly malformed JSON (bad escapes, trailing commas).
+        # json_repair fixes the most common cases without silently swallowing real errors.
+        try:
+            parsed = json_repair.loads(raw)
+        except Exception as repair_exc:
+            raise RuntimeError(f"Gemini returned unparseable JSON: {repair_exc} — raw: {raw[:300]}")
     valid    = {"tool", "agent", "mcp", "list", "workflow", "cve", "article", "video", "playlist"} | {c["slug"] for c in custom_cats}
     name     = str(parsed.get("name", "")).strip()
     bullets  = [str(b).strip() for b in parsed.get("bullets", []) if str(b).strip()][:3]
@@ -577,6 +807,7 @@ def _process_playlist(url: str):
                         result["name"],
                         result["bullets"],
                         result["tags"],
+                        content,
                     )
                     yield log("  embedding stored")
                 except Exception as exc:
@@ -641,6 +872,7 @@ def _process_playlist(url: str):
                 pl_result["name"],
                 pl_result["bullets"],
                 pl_result["tags"],
+                summary_text,
             )
             yield log("Embedding stored")
         except Exception as exc:
@@ -840,6 +1072,7 @@ def _process_blog_listing(url: str, selected_urls: list | None = None, listing_t
                             result["name"],
                             result["bullets"],
                             result["tags"],
+                            content,
                         )
                         yield log("  embedding stored")
                     except Exception as exc:
@@ -912,6 +1145,7 @@ def _process_blog_listing(url: str, selected_urls: list | None = None, listing_t
                     list_result["name"],
                     list_result["bullets"],
                     list_result["tags"],
+                    summary_text,
                 )
                 yield log("Listing embedding stored")
             except Exception as exc:
@@ -924,6 +1158,13 @@ def _process_blog_listing(url: str, selected_urls: list | None = None, listing_t
                 [(listing_id, eid) for eid in new_entry_ids],
             )
             db.commit()
+
+        # Auto-list: find-or-create a list named after the blog and add all children
+        if new_entry_ids:
+            auto_list_name = site_name or listing_title or url
+            auto_list_id = _get_or_create_list(db, auto_list_name)
+            _add_entries_to_list(db, auto_list_id, new_entry_ids)
+            yield log(f"Added {len(new_entry_ids)} articles to list '{auto_list_name}'")
 
         children = [_row_to_dict(r, db) for r in db.execute(
             "SELECT * FROM entries WHERE parent_id = ? ORDER BY id", (listing_id,)
@@ -944,7 +1185,7 @@ def _process_blog_listing(url: str, selected_urls: list | None = None, listing_t
 # ---------------------------------------------------------------------------
 # Core: process one URL — generator, owns its own DB connection
 # ---------------------------------------------------------------------------
-def _process_url(url: str):
+def _process_url(url: str, source: str = "manual"):
     # Playlists have their own full pipeline (cache + fetch + summarise)
     if _extract_playlist_id(url):
         yield from _process_playlist(url)
@@ -1002,9 +1243,9 @@ def _process_url(url: str):
             return
 
         cur = db.execute(
-            "INSERT INTO entries (url, name, bullets, category, tags, content) VALUES (?,?,?,?,?,?)",
+            "INSERT INTO entries (url, name, bullets, category, tags, content, source) VALUES (?,?,?,?,?,?,?)",
             (url, result["name"], json.dumps(result["bullets"]),
-             result["category"], json.dumps(result["tags"]), content),
+             result["category"], json.dumps(result["tags"]), content, source),
         )
         db.commit()
         yield log("Saved to knowledge base")
@@ -1016,6 +1257,7 @@ def _process_url(url: str):
                 result["name"],
                 result["bullets"],
                 result["tags"],
+                content,
             )
             yield log("Embedding stored")
         except Exception as exc:
@@ -1047,9 +1289,11 @@ def _row_to_dict(row, db=None) -> dict:
         "tags":        json.loads(row["tags"] or "[]"),
         "list_ids":    list_ids,
         "has_content": bool(row["content"]),
+        "has_pdf":     bool(row["pdf_data"]) if "pdf_data" in row.keys() else False,
         "read":        bool(row["read"]),
         "useful":      bool(row["useful"]),
         "parent_id":   row["parent_id"] if "parent_id" in row.keys() else None,
+        "source":      row["source"] if "source" in row.keys() else "manual",
         "created_at":  row["created_at"],
     }
 
@@ -1060,13 +1304,122 @@ def _bulk_list_ids(db, entry_ids: list[int]) -> dict[int, list[int]]:
         return {}
     placeholders = ",".join("?" * len(entry_ids))
     rows = db.execute(
-        f"SELECT entry_id, list_id FROM list_entries WHERE entry_id IN ({placeholders})",
+        f"SELECT entry_id, list_id FROM list_entries WHERE entry_id IN ({placeholders})",  # nosec B608 – placeholders are only '?' chars, not user data
         entry_ids,
     ).fetchall()
     result: dict[int, list[int]] = {eid: [] for eid in entry_ids}
     for r in rows:
         result[r["entry_id"]].append(r["list_id"])
     return result
+
+
+def _get_or_create_list(db, name: str) -> int:
+    """Return the id of a list with the given name, creating it if needed."""
+    row = db.execute("SELECT id FROM lists WHERE name = ?", (name,)).fetchone()
+    if row:
+        return row["id"]
+    cur = db.execute("INSERT INTO lists (name) VALUES (?)", (name,))
+    db.commit()
+    return cur.lastrowid
+
+
+def _add_entries_to_list(db, list_id: int, entry_ids: list[int]) -> None:
+    """Insert entries into a list, ignoring duplicates."""
+    if not entry_ids:
+        return
+    db.executemany(
+        "INSERT OR IGNORE INTO list_entries (list_id, entry_id) VALUES (?, ?)",
+        [(list_id, eid) for eid in entry_ids],
+    )
+    db.commit()
+
+
+# ---------------------------------------------------------------------------
+# PDF helpers
+# ---------------------------------------------------------------------------
+def _extract_pdf_text(file_bytes: bytes) -> str:
+    """Extract plain text from a PDF byte string (full document, no truncation)."""
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    parts = []
+    for page in doc:
+        parts.append(page.get_text())
+    doc.close()
+    return "".join(parts)
+
+
+def _process_pdf(file_bytes: bytes, filename: str):
+    """Generator: analyse a PDF and yield log/result/error events."""
+    def log(msg):
+        logger.info("[pdf:%s] %s", filename, msg)
+        return {"type": "log", "msg": msg}
+
+    sha = hashlib.sha256(file_bytes).hexdigest()
+    synthetic_url = f"pdf:{sha}"
+
+    db = sqlite3.connect(DB_PATH)
+    db.row_factory = sqlite3.Row
+    try:
+        custom_cats = [dict(r) for r in db.execute(
+            "SELECT slug, label FROM custom_categories ORDER BY id"
+        ).fetchall()]
+
+        row = db.execute("SELECT * FROM entries WHERE url = ?", (synthetic_url,)).fetchone()
+        if row:
+            if not row["pdf_data"]:
+                db.execute("UPDATE entries SET pdf_data = ? WHERE id = ?", (file_bytes, row["id"]))
+                db.commit()
+                yield log("Backfilled PDF data for existing entry")
+                row = db.execute("SELECT * FROM entries WHERE url = ?", (synthetic_url,)).fetchone()
+            else:
+                yield log("Already analyzed — returning saved entry")
+            yield {"type": "result", "entry": _row_to_dict(row, db)}
+            return
+
+        yield log("Extracting text from PDF")
+        try:
+            content = _extract_pdf_text(file_bytes)
+        except Exception as exc:
+            yield {"type": "error", "msg": f"PDF extraction failed: {exc}"}
+            return
+
+        if not content.strip():
+            yield {"type": "error", "msg": "No extractable text — scanned/image-only PDFs are not supported"}
+            return
+
+        yield log(f"Extracted {len(content):,} characters")
+
+        try:
+            result, gemini_logs = _call_gemini(content, custom_cats)
+            for msg in gemini_logs:
+                yield log(msg)
+        except EnvironmentError as exc:
+            yield {"type": "error", "msg": str(exc)}
+            return
+        except Exception as exc:
+            yield {"type": "error", "msg": f"Gemini failed: {exc}"}
+            return
+
+        cur = db.execute(
+            "INSERT INTO entries (url, name, bullets, category, tags, content, source, pdf_data) VALUES (?,?,?,?,?,?,?,?)",
+            (synthetic_url, result["name"], json.dumps(result["bullets"]),
+             result["category"], json.dumps(result["tags"]), content, "pdf", file_bytes),
+        )
+        db.commit()
+        yield log("Saved to knowledge base")
+
+        try:
+            _store_entry_embedding(
+                db, cur.lastrowid,
+                result["name"], result["bullets"], result["tags"], content,
+            )
+            yield log("Embedding stored")
+        except Exception as exc:
+            yield log(f"Embedding skipped: {exc}")
+
+        row = db.execute("SELECT * FROM entries WHERE url = ?", (synthetic_url,)).fetchone()
+        yield {"type": "result", "entry": _row_to_dict(row, db)}
+    finally:
+        db.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1081,6 +1434,7 @@ def add_cors(resp):
 
 
 @app.route("/analyze",                                   methods=["OPTIONS"])
+@app.route("/analyze-pdf",                               methods=["OPTIONS"])
 @app.route("/analyze-blog",                              methods=["OPTIONS"])
 @app.route("/scan-blog",                                 methods=["OPTIONS"])
 @app.route("/entries",                                   methods=["OPTIONS"])
@@ -1095,6 +1449,7 @@ def add_cors(resp):
 @app.route("/entries/<int:entry_id>",                    methods=["OPTIONS"])
 @app.route("/entries/<int:entry_id>/read",               methods=["OPTIONS"])
 @app.route("/entries/<int:entry_id>/content",            methods=["OPTIONS"])
+@app.route("/entries/<int:entry_id>/pdf",                methods=["OPTIONS"])
 @app.route("/categories",                                methods=["OPTIONS"])
 @app.route("/categories/<slug>",                         methods=["OPTIONS"])
 @app.route("/entries/<int:entry_id>/children",           methods=["OPTIONS"])
@@ -1136,6 +1491,52 @@ def analyze():
                     yield json.dumps({"url": url, "error": event["msg"]}) + "\n"
 
     return app.response_class(generate(), mimetype="application/x-ndjson")
+
+
+@app.route("/analyze-pdf", methods=["POST"])
+def analyze_pdf():
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+    f = request.files["file"]
+    if not f.filename or not f.filename.lower().endswith(".pdf"):
+        return jsonify({"error": "File must be a .pdf"}), 400
+    filename = f.filename
+    file_bytes = f.read()
+    logger.info("Analyze-PDF request: %s (%d bytes)", filename, len(file_bytes))
+
+    def generate():
+        for event in _process_pdf(file_bytes, filename):
+            if event["type"] == "log":
+                yield json.dumps({"url": filename, "log": event["msg"]}) + "\n"
+            elif event["type"] == "result":
+                yield json.dumps({"url": filename, "entry": event["entry"]}) + "\n"
+            elif event["type"] == "error":
+                yield json.dumps({"url": filename, "error": event["msg"]}) + "\n"
+
+    return app.response_class(stream_with_context(generate()), mimetype="application/x-ndjson")
+
+
+@app.route("/entries/<int:entry_id>/pdf", methods=["GET", "OPTIONS"])
+def download_pdf(entry_id):
+    db = sqlite3.connect(DB_PATH)
+    db.row_factory = sqlite3.Row
+    try:
+        row = db.execute("SELECT url, name, pdf_data FROM entries WHERE id = ?", (entry_id,)).fetchone()
+        if not row:
+            return jsonify({"error": "Not found"}), 404
+        if not row["pdf_data"]:
+            return jsonify({"error": "No PDF stored for this entry"}), 404
+        filename = (row["name"] or f"entry-{entry_id}").replace("/", "_") + ".pdf"
+        # HTTP headers must be latin-1 safe; strip any characters outside that range
+        filename = filename.encode("latin-1", "replace").decode("latin-1")
+        disposition = "attachment" if request.args.get("dl") else "inline"
+        return Response(
+            bytes(row["pdf_data"]),
+            mimetype="application/pdf",
+            headers={"Content-Disposition": f'{disposition}; filename="{filename}"'},
+        )
+    finally:
+        db.close()
 
 
 @app.route("/scan-blog", methods=["POST"])
@@ -1197,17 +1598,22 @@ def list_entries():
     list_id     = request.args.get("list_id",  "").strip()
     read_filter = request.args.get("read",     "").strip()
     useful_only = request.args.get("useful",   "").strip()
+    source_filter = request.args.get("source", "").strip().lower()
 
     db = get_db()
     query, params = "SELECT * FROM entries WHERE parent_id IS NULL", []
+
+    if source_filter in ("manual", "rss"):
+        query += " AND source = ?"
+        params.append(source_filter)
 
     if category and category != "all":
         query += " AND category = ?"
         params.append(category)
 
     if tag:
-        query += ' AND tags LIKE ?'
-        params.append(f'%"{tag}"%')
+        query += ' AND (tags LIKE ? OR id IN (SELECT parent_id FROM entries WHERE parent_id IS NOT NULL AND tags LIKE ?))'
+        params.extend([f'%"{tag}"%', f'%"{tag}"%'])
 
     if list_id:
         query += " AND id IN (SELECT entry_id FROM list_entries WHERE list_id = ?)"
@@ -1221,8 +1627,10 @@ def list_entries():
         query += " AND useful = 1"
 
     if search:
-        query += " AND (url LIKE ? OR name LIKE ? OR bullets LIKE ? OR tags LIKE ?)"
-        params.extend([f"%{search}%"] * 4)
+        query += (" AND (url LIKE ? OR name LIKE ? OR bullets LIKE ? OR tags LIKE ?"
+                  " OR id IN (SELECT parent_id FROM entries WHERE parent_id IS NOT NULL"
+                  " AND (url LIKE ? OR name LIKE ? OR bullets LIKE ? OR tags LIKE ?)))")
+        params.extend([f"%{search}%"] * 8)
 
     query += " ORDER BY created_at DESC"
     rows = db.execute(query, params).fetchall()
@@ -1230,10 +1638,29 @@ def list_entries():
     entry_ids = [r["id"] for r in rows]
     list_map  = _bulk_list_ids(db, entry_ids)
 
+    # Build matched_child_ids so the frontend can auto-open and filter children
+    matched_child_map: dict[int, list[int]] = {}
+    if tag or search:
+        parent_ids = [r["id"] for r in rows if r["category"] in ("playlist", "list", "blog")]
+        if parent_ids:
+            ph  = ",".join("?" * len(parent_ids))
+            cq  = f"SELECT id, parent_id FROM entries WHERE parent_id IN ({ph})"  # nosec B608 – ph contains only '?' placeholders
+            cp  = list(parent_ids)
+            if tag:
+                cq += " AND tags LIKE ?"
+                cp.append(f'%"{tag}"%')
+            if search:
+                cq += " AND (url LIKE ? OR name LIKE ? OR bullets LIKE ? OR tags LIKE ?)"
+                cp.extend([f"%{search}%"] * 4)
+            for c in db.execute(cq, cp).fetchall():
+                matched_child_map.setdefault(c["parent_id"], []).append(c["id"])
+
     result = []
     for r in rows:
         d = _row_to_dict(r)
         d["list_ids"] = list_map.get(r["id"], [])
+        if r["category"] in ("playlist", "list", "blog"):
+            d["matched_child_ids"] = matched_child_map.get(r["id"], [])
         result.append(d)
     return jsonify(result), 200
 
@@ -1260,6 +1687,11 @@ def update_entry(entry_id):
     custom_slugs = {r["slug"] for r in db.execute("SELECT slug FROM custom_categories").fetchall()}
     valid_cats = _BUILTIN_CATS | custom_slugs
     updates    = {}
+    if "name" in body:
+        name = str(body["name"]).strip()
+        if not name:
+            return jsonify({"error": "Name cannot be empty"}), 400
+        updates["name"] = name
     if "category" in body:
         cat = str(body["category"]).strip().lower()
         if cat not in valid_cats:
@@ -1267,10 +1699,20 @@ def update_entry(entry_id):
         updates["category"] = cat
     if "useful" in body:
         updates["useful"] = 1 if body["useful"] else 0
+    if "tags" in body:
+        tags = body.get("tags") or []
+        if not isinstance(tags, list):
+            return jsonify({"error": "Tags must be a list"}), 400
+        tags = [str(t).strip() for t in tags if str(t).strip()]
+        tags = sorted(set(tags))
+        updates["tags"] = json.dumps(tags)
     if not updates:
         return jsonify({"error": "Nothing to update"}), 400
-    set_clause = ", ".join(f"{k} = ?" for k in updates)
-    db.execute(f"UPDATE entries SET {set_clause} WHERE id = ?", [*updates.values(), entry_id])
+    _ALLOWED_PATCH_COLS = {"name", "category", "useful", "tags", "read"}
+    if not all(k in _ALLOWED_PATCH_COLS for k in updates):
+        return jsonify({"error": "Invalid field in update"}), 400
+    set_clause = ", ".join(f"{k} = ?" for k in updates)  # nosec B608 – keys validated against allowlist above
+    db.execute(f"UPDATE entries SET {set_clause} WHERE id = ?", [*updates.values(), entry_id])  # nosec B608
     db.commit()
     row = db.execute("SELECT * FROM entries WHERE id = ?", (entry_id,)).fetchone()
     return jsonify(_row_to_dict(row, db)), 200
@@ -1322,6 +1764,7 @@ def retry_summary(entry_id):
                 result["name"],
                 result["bullets"],
                 tags,
+                content,
             )
         except Exception as exc:
             logger.error("Retry embed failed for %d: %s", entry_id, exc)
@@ -1362,7 +1805,7 @@ def suggest():
     """Return one random unread entry. Returns null if all read."""
     exclude = request.args.get("exclude", "")
     db  = get_db()
-    q   = "SELECT * FROM entries WHERE read = 0"
+    q   = "SELECT * FROM entries WHERE read = 0 AND source = 'manual'"
     params: list = []
     if exclude:
         q += " AND id != ?"
@@ -1395,30 +1838,45 @@ def semantic_search():
         logger.error("Embed query failed: %s", exc)
         return jsonify({"error": str(exc)}), 500
 
-    db   = get_db()
-    rows = db.execute(
-        "SELECT * FROM entries WHERE embedding IS NOT NULL AND embedding != ''"
-    ).fetchall()
+    db     = get_db()
+    chunks = db.execute("SELECT entry_id, embedding FROM entry_chunks").fetchall()
+    if not chunks:
+        return jsonify([]), 200
 
-    scored = []
-    for row in rows:
+    # Best cosine score per entry across all its chunks
+    entry_scores: dict = {}
+    for chunk in chunks:
         try:
-            emb = json.loads(row["embedding"])
+            emb = json.loads(chunk["embedding"])
             sim = _cosine_sim(query_emb, emb)
-            scored.append((sim, row))
+            eid = chunk["entry_id"]
+            if sim > entry_scores.get(eid, 0):
+                entry_scores[eid] = sim
         except Exception:
             continue
 
-    scored.sort(key=lambda x: -x[0])
-    top       = [x for x in scored[:20] if x[0] > 0.25]
-    entry_ids = [r["id"] for _, r in top]
-    list_map  = _bulk_list_ids(db, entry_ids)
+    top_pairs = sorted(
+        [(eid, s) for eid, s in entry_scores.items() if s > 0.25],
+        key=lambda x: -x[1],
+    )[:20]
+    if not top_pairs:
+        return jsonify([]), 200
+
+    top_ids   = [eid for eid, _ in top_pairs]
+    score_map = {eid: s for eid, s in top_pairs}
+    ph        = ",".join("?" * len(top_ids))
+    rows      = db.execute(f"SELECT * FROM entries WHERE id IN ({ph})", top_ids).fetchall()  # nosec B608 – ph contains only '?' placeholders
+    entry_map = {r["id"]: r for r in rows}
+    list_map  = _bulk_list_ids(db, top_ids)
 
     results = []
-    for sim, row in top:
-        d            = _row_to_dict(row)
-        d["list_ids"] = list_map.get(row["id"], [])
-        d["score"]   = round(sim, 3)
+    for eid in top_ids:
+        row = entry_map.get(eid)
+        if not row:
+            continue
+        d             = _row_to_dict(row)
+        d["list_ids"] = list_map.get(eid, [])
+        d["score"]    = round(score_map[eid], 3)
         results.append(d)
 
     logger.info("Semantic search %r → %d results", q, len(results))
@@ -1427,23 +1885,20 @@ def semantic_search():
 
 @app.route("/entries/embed-all", methods=["POST"])
 def embed_all():
-    """Retroactively compute embeddings for entries that don't have one."""
+    """Chunk and embed all entries that don't have chunks yet."""
     if not _API_KEY:
         return jsonify({"error": "GEMINI_API_KEY not set"}), 500
     db   = get_db()
     rows = db.execute(
-        "SELECT * FROM entries WHERE embedding IS NULL OR embedding = ''"
+        "SELECT * FROM entries WHERE id NOT IN (SELECT DISTINCT entry_id FROM entry_chunks)"
     ).fetchall()
     done, failed = 0, 0
     for row in rows:
         try:
             bullets = json.loads(row["bullets"] or "[]")
             tags    = json.loads(row["tags"]    or "[]")
-            text    = _entry_embed_text(row["name"] or "", bullets, tags)
-            emb     = _get_embedding(text)
-            db.execute("UPDATE entries SET embedding = ? WHERE id = ?",
-                       (json.dumps(emb), row["id"]))
-            db.commit()
+            content = row["content"] or ""
+            _store_entry_embedding(db, row["id"], row["name"] or "", bullets, tags, content)
             done += 1
         except Exception as exc:
             logger.error("embed-all row %d: %s", row["id"], exc)
@@ -1576,6 +2031,727 @@ def delete_category(slug):
 
 
 # ---------------------------------------------------------------------------
+# RSS Feed Polling
+# ---------------------------------------------------------------------------
+
+def _poll_rss_feed(db, feed_id: int, feed_url: str) -> int:
+    """Fetch and parse one RSS/Atom feed; analyse new entries. Returns count added."""
+    try:
+        parsed = feedparser.parse(feed_url)
+    except Exception as exc:
+        logger.warning("RSS fetch failed for %s: %s", feed_url, exc)
+        return 0
+
+    # Determine the list name from the feed title or its stored name
+    feed_row = db.execute("SELECT name FROM rss_feeds WHERE id = ?", (feed_id,)).fetchone()
+    feed_title = (feed_row["name"] if feed_row and feed_row["name"] else "") or \
+                 getattr(getattr(parsed, "feed", None), "title", "") or feed_url
+    auto_list_id = _get_or_create_list(db, feed_title)
+
+    added = 0
+    new_ids = []
+    for item in parsed.entries:
+        url = item.get("link", "").strip()
+        if not url or not url.startswith(("http://", "https://")):
+            continue
+        existing = db.execute("SELECT id FROM entries WHERE url = ?", (url,)).fetchone()
+        if existing:
+            # Still add to list if not already there
+            _add_entries_to_list(db, auto_list_id, [existing["id"]])
+            continue
+        try:
+            entry_id = None
+            for event in _process_url(url, source="rss"):
+                if event.get("type") == "error":
+                    logger.warning("RSS analysis error for %s: %s", url, event.get("msg"))
+                elif event.get("type") == "result":
+                    entry_id = event["entry"]["id"]
+            if entry_id:
+                new_ids.append(entry_id)
+        except Exception as exc:
+            logger.warning("RSS item skipped (%s): %s", url, exc)
+            continue
+        added += 1
+
+    if new_ids:
+        _add_entries_to_list(db, auto_list_id, new_ids)
+
+    db.execute(
+        "UPDATE rss_feeds SET last_checked = datetime('now') WHERE id = ?",
+        (feed_id,),
+    )
+    db.commit()
+    logger.info("RSS feed %s polled: %d new entries added to list '%s'", feed_url, added, feed_title)
+    return added
+
+
+def _poll_all_feeds():
+    """Poll all registered RSS feeds. Called by the background scheduler."""
+    db = sqlite3.connect(DB_PATH)
+    db.row_factory = sqlite3.Row
+    try:
+        feeds = db.execute("SELECT id, url FROM rss_feeds").fetchall()
+        for feed in feeds:
+            _poll_rss_feed(db, feed["id"], feed["url"])
+    except Exception as exc:
+        logger.error("RSS poll error: %s", exc)
+    finally:
+        db.close()
+
+
+def _resolve_yt_channel(url: str) -> tuple[str, str]:
+    """Return (channel_id, channel_name) for a YouTube channel URL.
+
+    Supports @handle, /channel/UCxxx, /c/name, /user/name formats.
+    Raises RuntimeError on failure.
+    """
+    try:
+        from pytubefix import Channel
+        ch = Channel(url)
+        channel_id   = ch.channel_id
+        channel_name = ch.channel_name or ch.title or url
+        if not channel_id:
+            raise RuntimeError("Could not resolve channel ID")
+        return channel_id, channel_name
+    except Exception as exc:
+        raise RuntimeError(f"Failed to resolve YouTube channel: {exc}")
+
+
+def _analyze_selected_yt_videos(channel_db_id: int, urls: list[str]):
+    """Background task: analyse a specific set of YT video URLs for a channel subscription."""
+    db = sqlite3.connect(DB_PATH)
+    db.row_factory = sqlite3.Row
+    try:
+        row = db.execute(
+            "SELECT id, channel_id, name FROM yt_channels WHERE id = ?", (channel_db_id,)
+        ).fetchone()
+        if not row:
+            return
+        auto_list_id = _get_or_create_list(db, row["name"] or row["channel_id"])
+        new_ids = []
+        for url in urls:
+            existing = db.execute("SELECT id FROM entries WHERE url = ?", (url,)).fetchone()
+            if existing:
+                _add_entries_to_list(db, auto_list_id, [existing["id"]])
+                continue
+            try:
+                entry_id = None
+                for event in _process_url(url, source="youtube"):
+                    if event.get("type") == "result":
+                        entry_id = event["entry"]["id"]
+                if entry_id:
+                    new_ids.append(entry_id)
+            except Exception as exc:
+                logger.warning("Selected YT video skipped (%s): %s", url, exc)
+        if new_ids:
+            _add_entries_to_list(db, auto_list_id, new_ids)
+        db.commit()
+    finally:
+        db.close()
+
+
+_YT_FEED_URL = "https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+
+
+def _poll_yt_channel(db, row) -> int:
+    """Fetch the latest videos for a YouTube channel and analyse new ones.
+
+    Returns the count of newly added entries.
+    """
+    channel_id   = row["channel_id"]
+    channel_name = row["name"] or channel_id
+    feed_url     = _YT_FEED_URL.format(channel_id=channel_id)
+
+    try:
+        parsed = feedparser.parse(feed_url)
+    except Exception as exc:
+        logger.warning("YT channel feed fetch failed for %s: %s", channel_id, exc)
+        return 0
+
+    auto_list_id = _get_or_create_list(db, channel_name)
+
+    added   = 0
+    new_ids = []
+    for item in parsed.entries:
+        # YouTube feed entries use the yt:videoId link element
+        url = item.get("link", "").strip()
+        if not url or not _extract_video_id(url):
+            continue
+        existing = db.execute("SELECT id FROM entries WHERE url = ?", (url,)).fetchone()
+        if existing:
+            _add_entries_to_list(db, auto_list_id, [existing["id"]])
+            continue
+        try:
+            entry_id = None
+            for event in _process_url(url, source="youtube"):
+                if event.get("type") == "error":
+                    logger.warning("YT channel analysis error for %s: %s", url, event.get("msg"))
+                elif event.get("type") == "result":
+                    entry_id = event["entry"]["id"]
+            if entry_id:
+                new_ids.append(entry_id)
+                added += 1
+        except Exception as exc:
+            logger.warning("YT channel item skipped (%s): %s", url, exc)
+
+    if new_ids:
+        _add_entries_to_list(db, auto_list_id, new_ids)
+
+    db.execute(
+        "UPDATE yt_channels SET last_checked = datetime('now') WHERE id = ?",
+        (row["id"],),
+    )
+    db.commit()
+    logger.info("YT channel %s polled: %d new videos added to list '%s'",
+                channel_name, added, channel_name)
+    return added
+
+
+def _poll_all_yt_channels():
+    """Poll all subscribed YouTube channels."""
+    db = sqlite3.connect(DB_PATH)
+    db.row_factory = sqlite3.Row
+    try:
+        channels = db.execute("SELECT id, channel_id, name FROM yt_channels").fetchall()
+        for ch in channels:
+            _poll_yt_channel(db, ch)
+    except Exception as exc:
+        logger.error("YT channel poll error: %s", exc)
+    finally:
+        db.close()
+
+
+def _start_rss_scheduler():
+    """Start a recurring background timer that polls all RSS feeds and YT channels every hour."""
+    def _run():
+        _poll_all_feeds()
+        _poll_all_yt_channels()
+        t = threading.Timer(3600, _run)
+        t.daemon = True
+        t.start()
+
+    initial = threading.Timer(60, _run)
+    initial.daemon = True
+    initial.start()
+    logger.info("RSS/YT scheduler started (first poll in 60s, then every 3600s)")
+
+
+# ---------------------------------------------------------------------------
+# RSS Feed API routes
+# ---------------------------------------------------------------------------
+
+@app.route("/rss-feeds", methods=["GET"])
+def list_rss_feeds():
+    db   = get_db()
+    rows = db.execute("""
+        SELECT f.id, f.url, f.name, f.last_checked, f.created_at,
+               COUNT(e.id) AS entry_count
+        FROM rss_feeds f
+        LEFT JOIN entries e ON e.source = 'rss'
+            AND e.url IN (SELECT url FROM entries WHERE source='rss')
+        GROUP BY f.id
+        ORDER BY f.created_at DESC
+    """).fetchall()
+    # Use a simpler query that counts entries where feed url is matched by domain heuristic
+    # Actually just return feed metadata + a total RSS entry count per feed stored in a separate way
+    # Simplest: return feeds, entry_count = total rss entries (not per-feed)
+    feeds = []
+    for r in db.execute("SELECT id, url, name, last_checked, created_at FROM rss_feeds ORDER BY created_at DESC").fetchall():
+        count = db.execute(
+            "SELECT COUNT(*) FROM entries WHERE source = 'rss'"
+        ).fetchone()[0]
+        feeds.append({
+            "id":           r["id"],
+            "url":          r["url"],
+            "name":         r["name"],
+            "last_checked": r["last_checked"],
+            "created_at":   r["created_at"],
+            "entry_count":  count,
+        })
+    return jsonify(feeds), 200
+
+
+@app.route("/rss-feeds", methods=["POST"])
+def add_rss_feed():
+    body = request.get_json(silent=True) or {}
+    url  = str(body.get("url", "")).strip()
+    name = str(body.get("name", "")).strip()
+    if not url.startswith(("http://", "https://")):
+        return jsonify({"error": "URL must start with http:// or https://"}), 400
+    db = get_db()
+    try:
+        row = db.execute(
+            "INSERT INTO rss_feeds (url, name) VALUES (?, ?) RETURNING id, url, name, last_checked, created_at",
+            (url, name),
+        ).fetchone()
+        db.commit()
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "Feed URL already exists"}), 409
+    return jsonify(dict(row)), 201
+
+
+@app.route("/rss-feeds/<int:feed_id>", methods=["DELETE"])
+def delete_rss_feed(feed_id):
+    db = get_db()
+    db.execute("DELETE FROM rss_feeds WHERE id = ?", (feed_id,))
+    db.commit()
+    return "", 204
+
+
+@app.route("/rss-feeds/<int:feed_id>/poll", methods=["POST"])
+def poll_rss_feed(feed_id):
+    db  = get_db()
+    row = db.execute("SELECT id, url FROM rss_feeds WHERE id = ?", (feed_id,)).fetchone()
+    if not row:
+        return jsonify({"error": "Feed not found"}), 404
+    # Use a fresh connection so _poll_rss_feed can commit independently
+    poll_db = sqlite3.connect(DB_PATH)
+    poll_db.row_factory = sqlite3.Row
+    try:
+        added = _poll_rss_feed(poll_db, row["id"], row["url"])
+    finally:
+        poll_db.close()
+    return jsonify({"added": added}), 200
+
+
+# ---------------------------------------------------------------------------
+# YouTube channel subscriptions
+# ---------------------------------------------------------------------------
+
+@app.route("/yt-channels",                  methods=["OPTIONS"])
+@app.route("/yt-channels/preview",          methods=["OPTIONS"])
+@app.route("/yt-channels/<int:cid>",        methods=["OPTIONS"])
+@app.route("/yt-channels/<int:cid>/poll",   methods=["OPTIONS"])
+def yt_channels_options(*args, **kwargs):
+    resp = jsonify({})
+    resp.headers["Access-Control-Allow-Origin"]  = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,DELETE,OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return resp, 204
+
+
+@app.route("/yt-channels/preview", methods=["POST"])
+def preview_yt_channel():
+    """Resolve a YouTube channel URL and return its latest video list without subscribing."""
+    body = request.get_json(silent=True) or {}
+    url  = str(body.get("url", "")).strip()
+    if not url.startswith(("http://", "https://")):
+        return jsonify({"error": "URL must start with http:// or https://"}), 400
+    try:
+        channel_id, channel_name = _resolve_yt_channel(url)
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 400
+    feed_url = _YT_FEED_URL.format(channel_id=channel_id)
+    try:
+        parsed = feedparser.parse(feed_url)
+    except Exception as exc:
+        return jsonify({"error": f"Failed to fetch channel feed: {exc}"}), 500
+    videos = []
+    for item in parsed.entries:
+        video_url = item.get("link", "").strip()
+        if not video_url or not _extract_video_id(video_url):
+            continue
+        thumbnail = None
+        if getattr(item, "media_thumbnail", None):
+            thumbnail = item.media_thumbnail[0].get("url")
+        videos.append({
+            "url":       video_url,
+            "title":     item.get("title", video_url),
+            "published": item.get("published", ""),
+            "thumbnail": thumbnail,
+        })
+    return jsonify({"channel_id": channel_id, "name": channel_name, "videos": videos}), 200
+
+
+@app.route("/yt-channels", methods=["GET"])
+def list_yt_channels():
+    db   = get_db()
+    rows = db.execute(
+        "SELECT id, channel_id, channel_url, name, last_checked, created_at FROM yt_channels ORDER BY created_at DESC"
+    ).fetchall()
+    channels = []
+    for r in rows:
+        channels.append({
+            "id":           r["id"],
+            "channel_id":   r["channel_id"],
+            "channel_url":  r["channel_url"],
+            "name":         r["name"],
+            "last_checked": r["last_checked"],
+            "created_at":   r["created_at"],
+        })
+    return jsonify(channels), 200
+
+
+@app.route("/yt-channels", methods=["POST"])
+def add_yt_channel():
+    body         = request.get_json(silent=True) or {}
+    url          = str(body.get("url", "")).strip()
+    name         = str(body.get("name", "")).strip()
+    analyze_urls = body.get("analyze_urls")   # list[str] | None; if provided, only these are analysed immediately
+    if not url.startswith(("http://", "https://")):
+        return jsonify({"error": "URL must start with http:// or https://"}), 400
+    try:
+        channel_id, resolved_name = _resolve_yt_channel(url)
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 400
+    display_name = name or resolved_name
+    db = get_db()
+    try:
+        row = db.execute(
+            """INSERT INTO yt_channels (channel_id, channel_url, name)
+               VALUES (?, ?, ?)
+               RETURNING id, channel_id, channel_url, name, last_checked, created_at""",
+            (channel_id, url, display_name),
+        ).fetchone()
+        db.commit()
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "Channel already subscribed"}), 409
+    channel_db_id = row["id"]
+    if analyze_urls is not None:
+        # Mark last_checked = now so the hourly scheduler only picks up NEW videos from here on.
+        db.execute("UPDATE yt_channels SET last_checked = datetime('now') WHERE id = ?", (channel_db_id,))
+        db.commit()
+        # Analyse only the explicitly selected videos in a background thread.
+        if analyze_urls:
+            t = threading.Thread(
+                target=_analyze_selected_yt_videos,
+                args=(channel_db_id, analyze_urls),
+                daemon=True,
+            )
+            t.start()
+    return jsonify(dict(row)), 201
+
+
+@app.route("/yt-channels/<int:cid>", methods=["DELETE"])
+def delete_yt_channel(cid):
+    db = get_db()
+    db.execute("DELETE FROM yt_channels WHERE id = ?", (cid,))
+    db.commit()
+    return "", 204
+
+
+@app.route("/yt-channels/<int:cid>/poll", methods=["POST"])
+def poll_yt_channel_endpoint(cid):
+    db  = get_db()
+    row = db.execute("SELECT id, channel_id, name FROM yt_channels WHERE id = ?", (cid,)).fetchone()
+    if not row:
+        return jsonify({"error": "Channel not found"}), 404
+    poll_db = sqlite3.connect(DB_PATH)
+    poll_db.row_factory = sqlite3.Row
+    try:
+        added = _poll_yt_channel(poll_db, row)
+    finally:
+        poll_db.close()
+    return jsonify({"added": added}), 200
+
+
+# ---------------------------------------------------------------------------
+# Chat sessions
+# ---------------------------------------------------------------------------
+
+@app.route("/chat/sessions", methods=["GET"])
+def list_chat_sessions():
+    db   = get_db()
+    rows = db.execute("""
+        SELECT cs.id, cs.title, cs.model, cs.created_at, cs.updated_at,
+               COUNT(cm.id) AS message_count
+        FROM chat_sessions cs
+        LEFT JOIN chat_messages cm ON cm.session_id = cs.id
+        GROUP BY cs.id
+        ORDER BY cs.updated_at DESC
+    """).fetchall()
+    return jsonify([dict(r) for r in rows]), 200
+
+
+@app.route("/chat/sessions", methods=["POST"])
+def create_chat_session():
+    body  = request.get_json(silent=True) or {}
+    model = (body.get("model") or "gemini-2.5-flash").strip()
+    title = (body.get("title") or "").strip() or "Untitled"
+    db    = get_db()
+    cur   = db.execute(
+        "INSERT INTO chat_sessions (title, model) VALUES (?,?)", (title, model)
+    )
+    db.commit()
+    row = db.execute("SELECT * FROM chat_sessions WHERE id = ?", (cur.lastrowid,)).fetchone()
+    return jsonify({**dict(row), "message_count": 0}), 201
+
+
+@app.route("/chat/sessions/<int:session_id>", methods=["PATCH"])
+def rename_chat_session(session_id):
+    body  = request.get_json(silent=True) or {}
+    title = body.get("title", "").strip()
+    if not title:
+        return jsonify({"error": "title required"}), 400
+    db = get_db()
+    db.execute(
+        "UPDATE chat_sessions SET title = ?, updated_at = datetime('now') WHERE id = ?",
+        (title, session_id),
+    )
+    db.commit()
+    return jsonify({"id": session_id, "title": title}), 200
+
+
+@app.route("/chat/sessions/<int:session_id>", methods=["DELETE"])
+def delete_chat_session(session_id):
+    db = get_db()
+    db.execute("DELETE FROM chat_sessions WHERE id = ?", (session_id,))
+    db.commit()
+    return "", 204
+
+
+@app.route("/chat/sessions/<int:session_id>/messages", methods=["GET"])
+def get_chat_messages(session_id):
+    db  = get_db()
+    row = db.execute("SELECT id FROM chat_sessions WHERE id = ?", (session_id,)).fetchone()
+    if not row:
+        return jsonify({"error": "Session not found"}), 404
+    msgs = db.execute(
+        "SELECT id, role, text, sources, created_at FROM chat_messages "
+        "WHERE session_id = ? ORDER BY created_at",
+        (session_id,),
+    ).fetchall()
+    result = []
+    for m in msgs:
+        d = dict(m)
+        try:
+            d["sources"] = json.loads(d["sources"] or "[]")
+        except Exception:
+            d["sources"] = []
+        result.append(d)
+    return jsonify(result), 200
+
+
+_VALID_CHAT_MODELS = {"gemini-2.5-flash", "gemini-2.5-pro", "gemini-1.5-flash", "gemini-1.5-pro"}
+
+_CHAT_SYSTEM_PROMPT = (
+    "You are a cyber-security expert assistant. "
+    "Answer ONLY using the knowledge base context provided below. "
+    "Cite the entry names you used. "
+    "If the answer is not in the context, say so explicitly.\n\n"
+    "KNOWLEDGE BASE CONTEXT:\n{context}"
+)
+
+
+@app.route("/entries/search")
+def search_entries_autocomplete():
+    q    = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify([]), 200
+    db   = get_db()
+    like = f"%{q}%"
+    rows = db.execute(
+        "SELECT id, name, url, category FROM entries WHERE parent_id IS NULL"
+        " AND (name LIKE ? OR url LIKE ?) ORDER BY name LIMIT 20",
+        (like, like),
+    ).fetchall()
+    return jsonify([dict(r) for r in rows]), 200
+
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    body       = request.get_json(silent=True) or {}
+    question   = (body.get("question") or "").strip()
+    session_id = body.get("session_id")
+    model_name = (body.get("model") or _MODEL_NAME).strip()
+    pinned_ids = [int(x) for x in (body.get("pinned_ids") or []) if str(x).isdigit()]
+
+    if not question:
+        return jsonify({"error": "question required"}), 400
+    if not session_id:
+        return jsonify({"error": "session_id required"}), 400
+    if not _API_KEY:
+        return jsonify({"error": "GEMINI_API_KEY not set"}), 500
+    if model_name not in _VALID_CHAT_MODELS:
+        model_name = _MODEL_NAME
+
+    # Pre-flight: validate session exists (uses request-context DB, safe here)
+    pre_db = get_db()
+    session_row = pre_db.execute("SELECT * FROM chat_sessions WHERE id = ?", (session_id,)).fetchone()
+    if not session_row:
+        return jsonify({"error": "Session not found"}), 404
+    session_title   = session_row["title"]
+    history_rows    = pre_db.execute(
+        "SELECT role, text FROM chat_messages WHERE session_id = ? ORDER BY created_at",
+        (session_id,),
+    ).fetchall()
+    history_data = [(r["role"], r["text"]) for r in history_rows]
+
+    def generate():
+        # Open a dedicated connection — the Flask request context is gone by the
+        # time the generator runs, so we must NOT use get_db() / g here.
+        sdb = sqlite3.connect(DB_PATH)
+        sdb.row_factory = sqlite3.Row
+        nonlocal session_title
+        try:
+            sources, context_parts = [], []
+
+            if pinned_ids:
+                # ── Pinned-entry mode: skip RAG, use caller-selected entries ──
+                ph         = ",".join("?" * len(pinned_ids))
+                entry_rows = sdb.execute(
+                    f"SELECT * FROM entries WHERE id IN ({ph})", pinned_ids  # nosec B608 – ph contains only '?' placeholders
+                ).fetchall()
+                for row in entry_rows:
+                    # Pull ALL chunks ordered by index to reconstruct the full content
+                    chunk_rows = sdb.execute(
+                        "SELECT chunk_text FROM entry_chunks WHERE entry_id = ? ORDER BY chunk_index",
+                        (row["id"],),
+                    ).fetchall()
+                    if chunk_rows:
+                        chunk_text = "\n\n".join(r["chunk_text"] for r in chunk_rows)
+                    else:
+                        chunk_text = (row["content"] or "").strip()
+                    sources.append({"id": row["id"], "name": row["name"],
+                                    "url": row["url"], "pinned": True})
+                    context_parts.append(f"## {row['name']}\nURL: {row['url']}\n\n{chunk_text}")
+            else:
+                # ── RAG retrieval ──────────────────────────────────────────
+                try:
+                    query_emb = _get_embedding(question, task_type="RETRIEVAL_QUERY")
+                except Exception as exc:
+                    yield json.dumps({"type": "error", "message": f"Embedding failed: {exc}"}) + "\n"
+                    return
+
+                chunks = sdb.execute(
+                    "SELECT entry_id, chunk_text, embedding FROM entry_chunks"
+                ).fetchall()
+
+                entry_scores: dict = {}
+                for chunk in chunks:
+                    try:
+                        emb = json.loads(chunk["embedding"])
+                        sim = _cosine_sim(query_emb, emb)
+                        eid = chunk["entry_id"]
+                        if sim > entry_scores.get(eid, (-1, ""))[0]:
+                            entry_scores[eid] = (sim, chunk["chunk_text"])
+                    except Exception:
+                        continue
+
+                top_entries = sorted(
+                    [(eid, sc, txt) for eid, (sc, txt) in entry_scores.items() if sc > 0.2],
+                    key=lambda x: -x[1],
+                )[:8]
+
+                if top_entries:
+                    top_ids    = [eid for eid, _, _ in top_entries]
+                    ph         = ",".join("?" * len(top_ids))
+                    entry_rows = sdb.execute(f"SELECT * FROM entries WHERE id IN ({ph})", top_ids).fetchall()  # nosec B608 – ph contains only '?' placeholders
+                    entry_map  = {r["id"]: r for r in entry_rows}
+                    for eid, score, chunk_text in top_entries:
+                        row = entry_map.get(eid)
+                        if not row:
+                            continue
+                        sources.append({"id": eid, "name": row["name"], "url": row["url"],
+                                         "score": round(score, 3)})
+                        context_parts.append(f"## {row['name']}\nURL: {row['url']}\n\n{chunk_text}")
+
+            yield json.dumps({"type": "sources", "entries": sources}) + "\n"
+
+            context_text = "\n\n---\n\n".join(context_parts)[:24000] if context_parts \
+                else "No relevant knowledge base entries found."
+
+            if pinned_ids:
+                system_prompt = (
+                    "You are a cyber-security expert assistant. "
+                    "The user has pinned specific articles/entries for this question. "
+                    "Answer ONLY using the pinned entries provided below — do not draw on any other knowledge. "
+                    "Cite the entry names you used. "
+                    "If the answer is not in the pinned entries, say so explicitly.\n\n"
+                    f"PINNED ENTRIES:\n{context_text}"
+                )
+            else:
+                system_prompt = _CHAT_SYSTEM_PROMPT.format(context=context_text)
+
+            # ── Gemini conversation history ────────────────────────────────
+            gemini_contents = []
+            for role, text in history_data:
+                gemini_role = "model" if role == "assistant" else "user"
+                gemini_contents.append({"role": gemini_role, "parts": [{"text": text}]})
+            gemini_contents.append({"role": "user", "parts": [{"text": question}]})
+
+            # ── Stream LLM response ────────────────────────────────────────
+            try:
+                stream = _genai_client.models.generate_content_stream(
+                    model=model_name,
+                    contents=gemini_contents,
+                    config=genai_types.GenerateContentConfig(
+                        system_instruction=system_prompt,
+                        temperature=0.3,
+                        max_output_tokens=2048,
+                        thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
+                    ),
+                )
+                full_response = []
+                for chunk in stream:
+                    text = chunk.text or ""
+                    if text:
+                        full_response.append(text)
+                        yield json.dumps({"type": "chunk", "text": text}) + "\n"
+
+                assembled = "".join(full_response)
+                sdb.execute(
+                    "INSERT INTO chat_messages (session_id, role, text, sources) VALUES (?,?,?,?)",
+                    (session_id, "user", question, "[]"),
+                )
+                sdb.execute(
+                    "INSERT INTO chat_messages (session_id, role, text, sources) VALUES (?,?,?,?)",
+                    (session_id, "assistant", assembled, json.dumps(sources)),
+                )
+                if not session_title or session_title.strip().lower() == "untitled":
+                    session_title = question[:60]
+                    sdb.execute(
+                        "UPDATE chat_sessions SET title = ?, updated_at = datetime('now') WHERE id = ?",
+                        (session_title, session_id),
+                    )
+                else:
+                    sdb.execute(
+                        "UPDATE chat_sessions SET updated_at = datetime('now') WHERE id = ?",
+                        (session_id,),
+                    )
+                sdb.commit()
+            except Exception as exc:
+                logger.error("Chat Gemini error: %s", exc)
+                yield json.dumps({"type": "error", "message": str(exc)}) + "\n"
+                return
+
+            yield json.dumps({"type": "done", "title": session_title}) + "\n"
+
+        finally:
+            sdb.close()
+
+    return Response(stream_with_context(generate()), mimetype="application/x-ndjson")
+
+
+# ---------------------------------------------------------------------------
+# Log viewer endpoints
+# ---------------------------------------------------------------------------
+
+@app.route("/logs")
+def get_log_entries():
+    since = request.args.get("since", 0, type=int)
+    return jsonify(_mem_log.get_since(since)), 200
+
+
+@app.route("/logs", methods=["DELETE"])
+def clear_log_entries():
+    _mem_log.clear()
+    return jsonify({"ok": True}), 200
+
+
+# ---------------------------------------------------------------------------
 # Boot
 # ---------------------------------------------------------------------------
-app.run(port=8000, debug=True, use_reloader=True)
+# Ensure database exists and is migrated to the latest schema before serving
+init_db()
+
+_debug = os.getenv("FLASK_DEBUG", "false").lower() == "true"
+
+# Backup on startup and every 12 hours (keep last 10 backups)
+# When running with the Flask reloader, only run backups in the reloader child.
+if not _debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+    _make_db_backup("startup")
+    _start_backup_scheduler(12)
+
+_start_rss_scheduler()
+app.run(port=8000, debug=_debug, use_reloader=_debug)

@@ -1,0 +1,41 @@
+name: Security Scans
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  # Job 1: Check for leaked secrets (API keys, tokens, etc.)
+  gitleaks:
+    name: Gitleaks Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read  # required by gitleaks-action to list PR commits
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Essential to scan the full commit history
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Job 2: Static Analysis for Python code
+  bandit:
+    name: Bandit Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install Bandit
+        run: pip install bandit
+      - name: Run Bandit
+        # -r scans recursively
+        # -ll reports only medium/high severity issues to reduce noise
+        run: bandit -r . -ll

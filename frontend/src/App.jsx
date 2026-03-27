@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import React, { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import * as d3 from "d3";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
@@ -36,6 +36,33 @@ function Spinner({ sm }) {
       <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
     </svg>
   );
+}
+
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+
+  componentDidCatch(error, info) {
+    console.error(error, info);
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="p-6 bg-accent-red/10 border border-accent-red/30 rounded-lg text-red-200">
+          <div className="font-bold mb-2">Something went wrong</div>
+          <pre className="text-xs whitespace-pre-wrap">{String(this.state.error)}</pre>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
 }
 
 function Badge({ category, customCats = [] }) {
@@ -155,12 +182,33 @@ function ListMenu({ entry, lists, onAdd, onRemove, onClose }) {
 
 // ─── entry card ───────────────────────────────────────────────────────────────
 
-function EntryCard({ entry, onToggleRead, onDelete, onTagClick, lists, onAddToList, onRemoveFromList, onUpdate, selected, onSelect, customCats = [] }) {
+function EntryCard({ entry, onToggleRead, onDelete, onTagClick, lists, onAddToList, onRemoveFromList, onUpdate, selected, onSelect, customCats = [], allTags = [] }) {
   const [deleting, setDeleting]       = useState(false);
   const [toggling, setToggling]       = useState(false);
   const [showLists, setShowLists]     = useState(false);
   const [showCatPick, setShowCatPick] = useState(false);
+  const [editingName, setEditingName] = useState(false);
+  const [draftName, setDraftName]     = useState(entry.name || "");
+  const [tags, setTags]               = useState(entry.tags || []);
+  const [tagInput, setTagInput]       = useState("");
   const catBtnRef = useRef(null);
+
+  useEffect(() => {
+    setDraftName(entry.name || "");
+  }, [entry.name]);
+
+  const tagSuggestions = useMemo(() => {
+    const q = tagInput.trim().toLowerCase();
+    if (!q) return [];
+    return (allTags || [])
+      .map(t => t.tag)
+      .filter(t => t.toLowerCase().includes(q) && !(tags || []).includes(t))
+      .slice(0, 6);
+  }, [tagInput, allTags, tags]);
+
+  useEffect(() => {
+    setTags(entry.tags || []);
+  }, [entry.tags]);
 
   const host = (() => {
     try { return new URL(entry.url).hostname.replace("www.", ""); }
@@ -196,11 +244,94 @@ function EntryCard({ entry, onToggleRead, onDelete, onTagClick, lists, onAddToLi
     onUpdate?.(updated);
   }
 
+  async function addTag(tag) {
+    const newTag = tag.trim();
+    if (!newTag) return;
+    const nextTags = Array.from(new Set([...(tags || []), newTag]));
+    const res = await fetch(`${API}/entries/${entry.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tags: nextTags }),
+    });
+    if (res.ok) {
+      const updated = await res.json();
+      setTags(updated.tags || []);
+      onUpdate?.(updated);
+    }
+  }
+
+  async function saveName(e) {
+    e?.preventDefault();
+    const nextName = (draftName || "").trim();
+    if (!nextName) {
+      setDraftName(entry.name || "");
+      setEditingName(false);
+      return;
+    }
+    if (nextName === entry.name) {
+      setEditingName(false);
+      return;
+    }
+    const res = await fetch(`${API}/entries/${entry.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: nextName }),
+    });
+    if (res.ok) {
+      const updated = await res.json();
+      onUpdate?.(updated);
+    }
+    setEditingName(false);
+  }
+
+  async function handleAddTag(e) {
+    e.preventDefault();
+    await addTag(tagInput);
+    setTagInput("");
+  }
+
+  async function handleRemoveTag(tag) {
+    const nextTags = (tags || []).filter(t => t !== tag);
+    const res = await fetch(`${API}/entries/${entry.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tags: nextTags }),
+    });
+    if (res.ok) {
+      const updated = await res.json();
+      setTags(updated.tags || []);
+      onUpdate?.(updated);
+    }
+  }
+
+  function handleCardClick(e) {
+    // If the user clicked on an interactive element, don’t navigate.
+    if (e.target.closest("button,a,input,textarea,select")) return;
+    const target = (entry.has_pdf || entry.url?.startsWith('pdf:')) ? `${API}/entries/${entry.id}/pdf` : entry.url;
+    if (target) window.open(target, "_blank");
+  }
+
+  function handleCardKeyDown(e) {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      const target = (entry.has_pdf || entry.url?.startsWith('pdf:')) ? `${API}/entries/${entry.id}/pdf` : entry.url;
+      if (target) window.open(target, "_blank");
+    }
+  }
+
   return (
-    <div className="rounded-lg border bg-surface-1 overflow-hidden"
-      style={{ borderColor: selected ? "#3fb950" : "#30363d" }}>
+    <div
+      className="rounded-lg border bg-surface-1 overflow-hidden"
+      style={{ borderColor: selected ? "#3fb950" : "#30363d" }}
+    >
       {/* header */}
-      <div className="flex items-center justify-between px-4 py-2 border-b border-border bg-surface-2">
+      <div
+        className="flex items-center justify-between px-4 py-2 border-b border-border bg-surface-2 cursor-pointer"
+        onClick={handleCardClick}
+        onKeyDown={handleCardKeyDown}
+        role="button"
+        tabIndex={0}
+      >
         <div className="flex items-center gap-2 min-w-0">
           {onSelect && (
             <input type="checkbox" checked={!!selected} onChange={() => onSelect(entry.id)}
@@ -233,8 +364,38 @@ function EntryCard({ entry, onToggleRead, onDelete, onTagClick, lists, onAddToLi
                 onClose={() => setShowCatPick(false)} />
             )}
           </div>
-          {entry.name && <span className="text-sm font-semibold text-gray-200 truncate">{entry.name}</span>}
-          <a href={entry.url} target="_blank" rel="noreferrer"
+          {entry.name && (
+            <div className="flex items-center gap-2 min-w-0">
+              {editingName ? (
+                <form onSubmit={saveName} onClick={e => e.stopPropagation()} className="flex items-center gap-2 min-w-0">
+                  <input
+                    value={draftName}
+                    onChange={e => setDraftName(e.target.value)}
+                    className="text-sm font-semibold text-gray-200 truncate bg-surface-2 px-2 py-1 rounded border border-border focus:outline-none focus:border-accent-blue"
+                    autoFocus
+                  />
+                  <button type="submit" className="text-xs text-accent-green hover:text-accent-green/80">Save</button>
+                  <button type="button" onClick={() => { setDraftName(entry.name || ""); setEditingName(false); }}
+                    className="text-xs text-gray-500 hover:text-gray-300">Cancel</button>
+                </form>
+              ) : (
+                <>
+                  <a href={entry.url} target="_blank" rel="noreferrer"
+                    className="text-sm font-semibold text-gray-200 truncate hover:text-accent-blue transition-colors"
+                    title={entry.name}>
+                    {entry.name}
+                  </a>
+                  <button type="button" onClick={e => { e.stopPropagation(); setEditingName(true); }}
+                    className="text-xs text-gray-500 hover:text-gray-300" title="Edit name">✎</button>
+                </>
+              )}
+            </div>
+          )}
+          {entry.source === "rss" && (
+            <span className="flex-shrink-0 px-1.5 py-0.5 rounded border border-orange-400/40 bg-orange-400/10 text-orange-400 text-xs font-bold uppercase tracking-wider">RSS</span>
+          )}
+          <a href={(entry.has_pdf || entry.url?.startsWith("pdf:")) ? `${API}/entries/${entry.id}/pdf` : entry.url}
+            target="_blank" rel="noreferrer"
             className="text-xs text-gray-600 hover:text-accent-blue truncate transition-colors font-mono hidden sm:block"
             title={entry.url}>{host}</a>
         </div>
@@ -265,6 +426,13 @@ function EntryCard({ entry, onToggleRead, onDelete, onTagClick, lists, onAddToLi
             className={`text-xs transition-colors ${entry.read ? "text-accent-green" : "text-gray-600 hover:text-accent-green/70"}`}>
             {toggling ? <Spinner sm /> : entry.read ? "✓ read" : "○ unread"}
           </button>
+          {entry.has_pdf && (
+            <a href={`${API}/entries/${entry.id}/pdf?dl=1`} target="_blank" rel="noreferrer"
+              onClick={e => e.stopPropagation()}
+              className="text-xs text-gray-700 hover:text-accent-blue transition-colors" title="Download PDF">
+              ⬇ PDF
+            </a>
+          )}
           <button onClick={async () => { setDeleting(true); await onDelete(entry.id); }}
             disabled={deleting}
             className="text-xs text-gray-700 hover:text-accent-red transition-colors">
@@ -297,24 +465,47 @@ function EntryCard({ entry, onToggleRead, onDelete, onTagClick, lists, onAddToLi
         ))}
       </ul>
       {/* tags */}
-      {entry.tags?.length > 0 && (
-        <div className="flex flex-wrap gap-1 px-5 pt-2 pb-3">
-          {entry.tags.map(tag => (
-            <button key={tag} onClick={() => onTagClick?.(tag)}
-              className="text-xs px-2 py-0.5 rounded border border-border bg-surface-2 text-gray-500
-                         hover:border-accent-blue/50 hover:text-accent-blue transition-colors font-mono">
-              #{tag}
-            </button>
+      <div className="px-5 pt-2 pb-3">
+        <div className="flex flex-wrap gap-1 mb-2">
+          {(tags || []).map(tag => (
+            <span key={tag} className="flex items-center gap-1 px-2 py-0.5 rounded border border-border bg-surface-2 text-xs font-mono">
+              <button type="button" onClick={() => onTagClick?.(tag)}
+                className="text-gray-500 hover:text-accent-blue transition-colors">
+                #{tag}
+              </button>
+              <button type="button" onClick={() => handleRemoveTag(tag)}
+                className="text-gray-600 hover:text-accent-red transition-colors">✕</button>
+            </span>
           ))}
         </div>
-      )}
+        <form onSubmit={handleAddTag} className="flex flex-col gap-2">
+          <div className="flex gap-2">
+            <input value={tagInput} onChange={e => setTagInput(e.target.value)}
+              placeholder="Add tag…"
+              className="flex-1 px-2 py-1 rounded text-xs font-mono bg-surface-2 border border-border text-gray-200" />
+            <button type="submit" className="px-3 py-1 text-xs rounded border border-border text-gray-400 hover:text-gray-200 hover:border-gray-500 transition-colors">
+              + Add
+            </button>
+          </div>
+          {tagSuggestions.length > 0 && (
+            <div className="flex flex-wrap gap-1">
+              {tagSuggestions.map(s => (
+                <button key={s} type="button" onClick={() => { addTag(s); setTagInput(""); }}
+                  className="text-xs px-2 py-0.5 rounded border border-border bg-surface-2 text-gray-500 hover:text-accent-blue transition-colors">
+                  {s}
+                </button>
+              ))}
+            </div>
+          )}
+        </form>
+      </div>
     </div>
   );
 }
 
 // ─── bulk action bar ──────────────────────────────────────────────────────────
 
-function BulkBar({ count, lists, onAddToList, onMarkRead, onMarkUseful, onClear }) {
+function BulkBar({ count, lists, onAddToList, onMarkRead, onMarkUseful, onDeleteSelected, onClear }) {
   const [showPick, setShowPick] = useState(false);
   const [newName, setNewName]   = useState("");
   const ref = useRef(null);
@@ -366,6 +557,10 @@ function BulkBar({ count, lists, onAddToList, onMarkRead, onMarkUseful, onClear 
         className="px-3 py-1.5 text-xs rounded border border-border text-gray-400 hover:text-yellow-400 hover:border-yellow-400/40 transition-colors">
         ★ Mark useful
       </button>
+      <button onClick={onDeleteSelected}
+        className="px-3 py-1.5 text-xs rounded border border-border text-accent-red hover:text-white hover:bg-accent-red hover:border-accent-red transition-colors">
+        🗑️ Delete
+      </button>
       <button onClick={onClear}
         className="px-3 py-1.5 text-xs rounded border border-border text-gray-600 hover:text-gray-400 transition-colors ml-auto">
         ✕ Clear
@@ -394,7 +589,43 @@ function LogLines({ logs }) {
 function VideoChildItem({ child, index, onTagClick, onRetried }) {
   const [retrying, setRetrying] = useState(false);
   const [error, setError]       = useState("");
+  const [tags, setTags]         = useState(child.tags || []);
+  const [tagInput, setTagInput] = useState("");
   const failed = child.tags?.includes("summary-failed");
+
+  useEffect(() => {
+    setTags(child.tags || []);
+  }, [child.tags]);
+
+  async function addTag(tag) {
+    const newTag = tag.trim();
+    if (!newTag) return;
+    const newTags = Array.from(new Set([...(tags || []), newTag]));
+    const res = await fetch(`${API}/entries/${child.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tags: newTags }),
+    });
+    if (res.ok) {
+      const updated = await res.json();
+      setTags(updated.tags || []);
+      onRetried?.(updated);
+    }
+  }
+
+  async function removeTag(tag) {
+    const newTags = (tags || []).filter(t => t !== tag);
+    const res = await fetch(`${API}/entries/${child.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tags: newTags }),
+    });
+    if (res.ok) {
+      const updated = await res.json();
+      setTags(updated.tags || []);
+      onRetried?.(updated);
+    }
+  }
 
   async function handleRetry() {
     setRetrying(true);
@@ -436,14 +667,27 @@ function VideoChildItem({ child, index, onTagClick, onRetried }) {
               </li>
             ))}
           </ul>
-          {child.tags?.length > 0 && (
-            <div className="flex flex-wrap gap-1 mt-1.5 ml-4">
-              {child.tags.map(t => (
-                <button key={t} onClick={() => onTagClick?.(t)}
-                  className="text-xs text-gray-700 hover:text-gray-500 transition-colors"># {t}</button>
+          <div className="ml-4 mt-2">
+            <div className="flex flex-wrap gap-1 mb-2">
+              {(tags || []).map(t => (
+                <span key={t} className="flex items-center gap-1 px-2 py-0.5 rounded border border-border bg-surface-2 text-xs font-mono">
+                  <button type="button" onClick={() => onTagClick?.(t)}
+                    className="text-gray-500 hover:text-accent-blue transition-colors"># {t}</button>
+                  <button type="button" onClick={() => removeTag(t)}
+                    className="text-gray-600 hover:text-accent-red transition-colors">✕</button>
+                </span>
               ))}
             </div>
-          )}
+            <form onSubmit={e => { e.preventDefault(); addTag(tagInput); setTagInput(""); }}
+              className="flex gap-2">
+              <input value={tagInput} onChange={e => setTagInput(e.target.value)}
+                placeholder="Add tag…"
+                className="flex-1 px-2 py-1 rounded text-xs font-mono bg-surface-2 border border-border text-gray-200" />
+              <button type="submit" className="px-3 py-1 text-xs rounded border border-border text-gray-400 hover:text-gray-200 hover:border-gray-500 transition-colors">
+                + Add
+              </button>
+            </form>
+          </div>
         </>
       )}
     </div>
@@ -452,11 +696,51 @@ function VideoChildItem({ child, index, onTagClick, onRetried }) {
 
 // ─── playlist card ────────────────────────────────────────────────────────────
 
-function PlaylistCard({ entry, onTagClick, customCats = [], onDelete }) {
-  const [open, setOpen]               = useState(false);
+function PlaylistCard({ entry, onTagClick, customCats = [], onDelete, onUpdate, allTags = [], matchedChildIds = [] }) {
+  const hasChildMatches               = matchedChildIds.length > 0;
+  const [open, setOpen]               = useState(hasChildMatches);
   const [children, setChildren]       = useState(entry.children || []);
   const [loadingKids, setLoadingKids] = useState(false);
   const [deleting, setDeleting]       = useState(false);
+  const [editingName, setEditingName] = useState(false);
+  const [draftName, setDraftName]     = useState(entry.name || "");
+  const [tags, setTags]               = useState(entry.tags || []);
+  const [tagInput, setTagInput]       = useState("");
+
+  // Auto-open and fetch children when a filter highlights matching children
+  useEffect(() => {
+    if (matchedChildIds.length > 0) {
+      setOpen(true);
+      if (children.length === 0) {
+        setLoadingKids(true);
+        fetch(`${API}/entries/${entry.id}/children`)
+          .then(r => r.json())
+          .then(data => { setChildren(data); setLoadingKids(false); })
+          .catch(() => setLoadingKids(false));
+      }
+    }
+  }, [matchedChildIds.length > 0]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const visibleChildren = hasChildMatches
+    ? children.filter(c => matchedChildIds.includes(c.id))
+    : children;
+
+  useEffect(() => {
+    setDraftName(entry.name || "");
+  }, [entry.name]);
+
+  const tagSuggestions = useMemo(() => {
+    const q = tagInput.trim().toLowerCase();
+    if (!q) return [];
+    return (allTags || [])
+      .map(t => t.tag)
+      .filter(t => t.toLowerCase().includes(q) && !(tags || []).includes(t))
+      .slice(0, 6);
+  }, [tagInput, allTags, tags]);
+
+  useEffect(() => {
+    setTags(entry.tags || []);
+  }, [entry.tags]);
 
   const isBlog      = entry.category === "blog";
   const isList      = entry.category === "list" || isBlog;
@@ -487,14 +771,103 @@ function PlaylistCard({ entry, onTagClick, customCats = [], onDelete }) {
     setOpen(o => !o);
   }
 
+  async function saveName(e) {
+    e?.preventDefault();
+    const nextName = (draftName || "").trim();
+    if (!nextName) {
+      setDraftName(entry.name || "");
+      setEditingName(false);
+      return;
+    }
+    if (nextName === entry.name) {
+      setEditingName(false);
+      return;
+    }
+    const res = await fetch(`${API}/entries/${entry.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: nextName }),
+    });
+    if (res.ok) {
+      const updated = await res.json();
+      onUpdate?.(updated);
+    }
+    setEditingName(false);
+  }
+
+  async function addTag(tag) {
+    const newTag = tag.trim();
+    if (!newTag) return;
+    const newTags = Array.from(new Set([...(tags || []), newTag]));
+    const res = await fetch(`${API}/entries/${entry.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tags: newTags }),
+    });
+    if (res.ok) {
+      const updated = await res.json();
+      setTags(updated.tags || []);
+      onUpdate?.(updated);
+    }
+  }
+
+  async function handleAddTag(e) {
+    e.preventDefault();
+    await addTag(tagInput);
+    setTagInput("");
+  }
+
+  async function handleRemoveTag(tag) {
+    const newTags = (tags || []).filter(t => t !== tag);
+    const res = await fetch(`${API}/entries/${entry.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tags: newTags }),
+    });
+    if (res.ok) {
+      const updated = await res.json();
+      setTags(updated.tags || []);
+      onUpdate?.(updated);
+    }
+  }
+
   return (
     <div className="rounded-lg border overflow-hidden" style={{ borderColor }}>
       {/* header */}
       <div className="flex items-center gap-3 px-4 py-2.5 bg-surface-2 border-b cursor-pointer select-none"
         style={{ borderColor: divColor }} onClick={handleToggle}>
         <Badge category={entry.category} customCats={customCats} />
-        <span className="text-sm font-medium text-gray-200 flex-1 truncate">{entry.name}</span>
-        <span className="text-xs text-gray-600">{children.length || (entry.children?.length ?? "?")} {childLabel}</span>
+        <div className="flex items-center gap-2 flex-1 min-w-0">
+          {editingName ? (
+            <form onSubmit={saveName} onClick={e => e.stopPropagation()} className="flex items-center gap-2 flex-1 min-w-0">
+              <input
+                value={draftName}
+                onChange={e => setDraftName(e.target.value)}
+                className="text-sm font-medium text-gray-200 truncate bg-surface-2 px-2 py-1 rounded border border-border focus:outline-none focus:border-accent-blue flex-1"
+                autoFocus
+              />
+              <button type="submit" className="text-xs text-accent-green hover:text-accent-green/80">Save</button>
+              <button type="button" onClick={e => { e.stopPropagation(); setDraftName(entry.name || ""); setEditingName(false); }}
+                className="text-xs text-gray-500 hover:text-gray-300">Cancel</button>
+            </form>
+          ) : (
+            <>
+              <a href={entry.url} target="_blank" rel="noreferrer"
+                onClick={e => e.stopPropagation()}
+                className="text-sm font-medium text-gray-200 flex-1 truncate hover:text-accent-blue transition-colors"
+                title={entry.name}>
+                {entry.name}
+              </a>
+              <button type="button" onClick={e => { e.stopPropagation(); setEditingName(true); }}
+                className="text-xs text-gray-500 hover:text-gray-300" title="Edit name">✎</button>
+            </>
+          )}
+        </div>
+        <span className="text-xs text-gray-600">
+          {hasChildMatches
+            ? <><span className="text-accent-green font-bold">{matchedChildIds.length}</span> / {children.length || (entry.children?.length ?? "?")} {childLabel}</>  
+            : `${children.length || (entry.children?.length ?? "?")} ${childLabel}`}
+        </span>
         <span className="text-gray-600 text-xs ml-1">{open ? "▲" : "▼"}</span>
         <button onClick={handleDelete} disabled={deleting}
           className="ml-1 text-gray-700 hover:text-accent-red transition-colors text-xs leading-none"
@@ -510,14 +883,38 @@ function PlaylistCard({ entry, onTagClick, customCats = [], onDelete }) {
             </li>
           ))}
         </ul>
-        {entry.tags?.length > 0 && (
-          <div className="flex flex-wrap gap-1 mt-2">
-            {entry.tags.map(t => (
-              <button key={t} onClick={() => onTagClick?.(t)}
-                className="text-xs text-gray-600 hover:text-gray-400 transition-colors"># {t}</button>
+        <div className="px-1 mt-2">
+          <div className="flex flex-wrap gap-1 mb-2">
+            {(tags || []).map(t => (
+              <span key={t} className="flex items-center gap-1 px-2 py-0.5 rounded border border-border bg-surface-2 text-xs font-mono">
+                <button type="button" onClick={() => onTagClick?.(t)}
+                  className="text-gray-500 hover:text-accent-blue transition-colors"># {t}</button>
+                <button type="button" onClick={() => handleRemoveTag(t)}
+                  className="text-gray-600 hover:text-accent-red transition-colors">✕</button>
+              </span>
             ))}
           </div>
-        )}
+          <form onSubmit={handleAddTag} className="flex flex-col gap-2">
+            <div className="flex gap-2">
+              <input value={tagInput} onChange={e => setTagInput(e.target.value)}
+                placeholder="Add tag…"
+                className="flex-1 px-2 py-1 rounded text-xs font-mono bg-surface-2 border border-border text-gray-200" />
+              <button type="submit" className="px-3 py-1 text-xs rounded border border-border text-gray-400 hover:text-gray-200 hover:border-gray-500 transition-colors">
+                + Add
+              </button>
+            </div>
+            {tagSuggestions.length > 0 && (
+              <div className="flex flex-wrap gap-1">
+                {tagSuggestions.map(s => (
+                  <button key={s} type="button" onClick={() => { addTag(s); setTagInput(""); }}
+                    className="text-xs px-2 py-0.5 rounded border border-border bg-surface-2 text-gray-500 hover:text-accent-blue transition-colors">
+                    {s}
+                  </button>
+                ))}
+              </div>
+            )}
+          </form>
+        </div>
       </div>
 
       {/* children */}
@@ -528,7 +925,7 @@ function PlaylistCard({ entry, onTagClick, customCats = [], onDelete }) {
               <Spinner sm /> Loading {childLabel}…
             </div>
           )}
-          {children.map((child, i) => (
+          {visibleChildren.map((child, i) => (
             <VideoChildItem key={child.id} child={child} index={i}
               onTagClick={onTagClick}
               onRetried={updated => setChildren(prev => prev.map(c => c.id === updated.id ? updated : c))} />
@@ -543,8 +940,8 @@ function ProgressItem({ item, lists, onAddToList, onRemoveFromList, onUpdate, cu
   const [logsOpen, setLogsOpen] = useState(true);
 
   if (item.status === "ok") {
-    const card = ["playlist", "list", "blog"].includes(item.entry?.category)
-      ? <PlaylistCard entry={item.entry} customCats={customCats} />
+    const card = ["playlist", "blog"].includes(item.entry?.category)
+      ? <PlaylistCard entry={item.entry} customCats={customCats} onUpdate={onUpdate} />
       : <EntryCard entry={item.entry} onToggleRead={() => {}} onDelete={() => {}}
           lists={lists} onAddToList={onAddToList} onRemoveFromList={onRemoveFromList} onUpdate={onUpdate} customCats={customCats} />;
     return (
@@ -643,6 +1040,348 @@ function SuggestCard({ onTagClick, lists, onAddToList, onRemoveFromList, onUpdat
   );
 }
 
+// ─── RSS tab ──────────────────────────────────────────────────────────────────
+
+function RssTab() {
+  const [feeds, setFeeds]       = useState([]);
+  const [loading, setLoading]   = useState(true);
+  const [url, setUrl]           = useState("");
+  const [name, setName]         = useState("");
+  const [adding, setAdding]     = useState(false);
+  const [error, setError]       = useState("");
+  const [polling, setPolling]   = useState({}); // { feedId: true }
+  const [pollResult, setPollResult] = useState({}); // { feedId: N }
+
+  // YouTube channel subscriptions state
+  const [channels, setChannels]         = useState([]);
+  const [chLoading, setChLoading]       = useState(true);
+  const [chUrl, setChUrl]               = useState("");
+  const [chName, setChName]             = useState("");
+  const [chPreviewing, setChPreviewing] = useState(false);
+  const [chPreview, setChPreview]       = useState(null);   // { channel_id, name, videos }
+  const [chSelected, setChSelected]     = useState(new Set()); // selected video URLs
+  const [chAdding, setChAdding]         = useState(false);
+  const [chError, setChError]           = useState("");
+  const [chPolling, setChPolling]       = useState({});
+  const [chPollResult, setChPollResult] = useState({});
+
+  async function fetchFeeds() {
+    try {
+      const data = await (await fetch(`${API}/rss-feeds`)).json();
+      setFeeds(Array.isArray(data) ? data : []);
+    } catch (e) { console.error(e); }
+    finally { setLoading(false); }
+  }
+
+  async function fetchChannels() {
+    try {
+      const data = await (await fetch(`${API}/yt-channels`)).json();
+      setChannels(Array.isArray(data) ? data : []);
+    } catch (e) { console.error(e); }
+    finally { setChLoading(false); }
+  }
+
+  useEffect(() => { fetchFeeds(); fetchChannels(); }, []);
+
+  async function handleAdd(e) {
+    e.preventDefault();
+    setError("");
+    if (!url.trim()) return;
+    setAdding(true);
+    try {
+      const res  = await fetch(`${API}/rss-feeds`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: url.trim(), name: name.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok) { setError(data.error || "Failed to add feed"); return; }
+      setFeeds(prev => [data, ...prev]);
+      setUrl(""); setName("");
+    } catch (e) { setError("Network error"); }
+    finally { setAdding(false); }
+  }
+
+  async function handleDelete(id) {
+    await fetch(`${API}/rss-feeds/${id}`, { method: "DELETE" });
+    setFeeds(prev => prev.filter(f => f.id !== id));
+  }
+
+  async function handlePoll(id) {
+    setPolling(prev => ({ ...prev, [id]: true }));
+    setPollResult(prev => ({ ...prev, [id]: null }));
+    try {
+      const res  = await fetch(`${API}/rss-feeds/${id}/poll`, { method: "POST" });
+      const data = await res.json();
+      setPollResult(prev => ({ ...prev, [id]: data.added }));
+      fetchFeeds();
+    } catch (e) { setPollResult(prev => ({ ...prev, [id]: -1 })); }
+    finally { setPolling(prev => ({ ...prev, [id]: false })); }
+  }
+
+  // Step 1: fetch channel videos for selection
+  async function handleChPreview(e) {
+    e.preventDefault();
+    setChError("");
+    if (!chUrl.trim()) return;
+    setChPreviewing(true);
+    setChPreview(null);
+    try {
+      const res  = await fetch(`${API}/yt-channels/preview`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: chUrl.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok) { setChError(data.error || "Failed to preview channel"); return; }
+      setChPreview(data);
+      // Pre-select all videos by default
+      setChSelected(new Set(data.videos.map(v => v.url)));
+    } catch (e) { setChError("Network error"); }
+    finally { setChPreviewing(false); }
+  }
+
+  function toggleVideo(url) {
+    setChSelected(prev => {
+      const next = new Set(prev);
+      next.has(url) ? next.delete(url) : next.add(url);
+      return next;
+    });
+  }
+
+  function toggleAllVideos(selectAll) {
+    if (!chPreview) return;
+    setChSelected(selectAll ? new Set(chPreview.videos.map(v => v.url)) : new Set());
+  }
+
+  // Step 2: subscribe + queue selected videos for analysis
+  async function handleChSubscribe(analyzeSelected) {
+    if (!chPreview) return;
+    setChAdding(true);
+    setChError("");
+    try {
+      const body = {
+        url:          chUrl.trim(),
+        name:         chName.trim() || chPreview.name,
+        analyze_urls: analyzeSelected ? [...chSelected] : [],
+      };
+      const res  = await fetch(`${API}/yt-channels`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (!res.ok) { setChError(data.error || "Failed to subscribe"); return; }
+      setChannels(prev => [data, ...prev]);
+      setChUrl(""); setChName(""); setChPreview(null); setChSelected(new Set());
+    } catch (e) { setChError("Network error"); }
+    finally { setChAdding(false); }
+  }
+
+  async function handleChDelete(id) {
+    await fetch(`${API}/yt-channels/${id}`, { method: "DELETE" });
+    setChannels(prev => prev.filter(c => c.id !== id));
+  }
+
+  async function handleChPoll(id) {
+    setChPolling(prev => ({ ...prev, [id]: true }));
+    setChPollResult(prev => ({ ...prev, [id]: null }));
+    try {
+      const res  = await fetch(`${API}/yt-channels/${id}/poll`, { method: "POST" });
+      const data = await res.json();
+      setChPollResult(prev => ({ ...prev, [id]: data.added }));
+      fetchChannels();
+    } catch (e) { setChPollResult(prev => ({ ...prev, [id]: -1 })); }
+    finally { setChPolling(prev => ({ ...prev, [id]: false })); }
+  }
+
+  return (
+    <div className="max-w-2xl space-y-10">
+      {/* ── RSS Feeds ───────────────────────────────────────── */}
+      <div className="space-y-6">
+        <div>
+          <h2 className="text-sm font-bold text-gray-300 uppercase tracking-widest mb-1">RSS Feeds</h2>
+          <p className="text-xs text-gray-600">Add RSS/Atom feeds — the server checks for new posts every hour and adds them to the Knowledge Base automatically. RSS entries are KB-only and won't appear in Suggested Read.</p>
+        </div>
+
+        {/* Add feed form */}
+        <form onSubmit={handleAdd} className="flex flex-col gap-2">
+          <div className="flex gap-2">
+            <input value={url} onChange={e => setUrl(e.target.value)}
+              placeholder="Feed URL (https://...)"
+              className="flex-1 bg-surface-1 border border-border rounded px-3 py-2 text-xs text-gray-200 placeholder-gray-700 font-mono outline-none focus:border-accent-green/50" />
+            <input value={name} onChange={e => setName(e.target.value)}
+              placeholder="Name (optional)"
+              className="w-40 bg-surface-1 border border-border rounded px-3 py-2 text-xs text-gray-200 placeholder-gray-700 font-mono outline-none focus:border-accent-green/50" />
+            <button type="submit" disabled={adding || !url.trim()}
+              className="px-4 py-2 rounded border border-accent-green/40 text-accent-green text-xs font-bold hover:bg-accent-green/10 transition-colors disabled:opacity-40">
+              {adding ? <Spinner sm /> : "+ Add"}
+            </button>
+          </div>
+          {error && <p className="text-xs text-accent-red">{error}</p>}
+        </form>
+
+        {/* Feed list */}
+        {loading ? (
+          <div className="flex items-center gap-2 text-sm text-gray-700"><Spinner /><span>Loading…</span></div>
+        ) : feeds.length === 0 ? (
+          <div className="text-xs text-gray-700 mt-4">No feeds yet. Add one above.</div>
+        ) : (
+          <div className="space-y-2">
+            {feeds.map(feed => (
+              <div key={feed.id} className="flex items-center justify-between gap-3 px-4 py-3 rounded border border-border bg-surface-1">
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-semibold text-gray-200 truncate">{feed.name || feed.url}</span>
+                    <span className="flex-shrink-0 px-1.5 py-0.5 rounded border border-orange-400/40 bg-orange-400/10 text-orange-400 text-xs font-bold">RSS</span>
+                  </div>
+                  {feed.name && <p className="text-xs text-gray-600 font-mono truncate mt-0.5">{feed.url}</p>}
+                  <p className="text-xs text-gray-700 mt-0.5">
+                    {feed.last_checked
+                      ? `Last checked: ${new Date(feed.last_checked).toLocaleString()}`
+                      : "Not yet checked"}
+                    {" · "}{feed.entry_count ?? 0} RSS entries in KB
+                  </p>
+                </div>
+                <div className="flex items-center gap-2 flex-shrink-0">
+                  {pollResult[feed.id] != null && (
+                    <span className={`text-xs ${pollResult[feed.id] < 0 ? "text-accent-red" : "text-accent-green"}`}>
+                      {pollResult[feed.id] < 0 ? "Error" : `+${pollResult[feed.id]} new`}
+                    </span>
+                  )}
+                  <button onClick={() => handlePoll(feed.id)} disabled={polling[feed.id]}
+                    className="px-2 py-1 rounded border border-border text-xs text-gray-500 hover:text-accent-blue hover:border-accent-blue/40 transition-colors disabled:opacity-40 flex items-center gap-1">
+                    {polling[feed.id] ? <><Spinner sm />Polling…</> : "↻ Poll now"}
+                  </button>
+                  <button onClick={() => handleDelete(feed.id)}
+                    className="text-xs text-gray-700 hover:text-accent-red transition-colors">✕</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* ── YouTube Subscriptions ───────────────────────────── */}
+      <div className="space-y-6">
+        <div>
+          <h2 className="text-sm font-bold text-gray-300 uppercase tracking-widest mb-1">YouTube Subscriptions</h2>
+          <p className="text-xs text-gray-600">Subscribe to a YouTube channel — new videos will be automatically analysed and added to the Knowledge Base every hour. Paste any channel URL (e.g. <span className="font-mono">https://www.youtube.com/@handle</span>).</p>
+        </div>
+
+        {/* Step 1: URL form */}
+        <form onSubmit={handleChPreview} className="flex flex-col gap-2">
+          <div className="flex gap-2">
+            <input value={chUrl} onChange={e => { setChUrl(e.target.value); setChPreview(null); }}
+              placeholder="Channel URL (https://www.youtube.com/@...)"
+              className="flex-1 bg-surface-1 border border-border rounded px-3 py-2 text-xs text-gray-200 placeholder-gray-700 font-mono outline-none focus:border-red-400/50" />
+            <input value={chName} onChange={e => setChName(e.target.value)}
+              placeholder="Label (optional)"
+              className="w-36 bg-surface-1 border border-border rounded px-3 py-2 text-xs text-gray-200 placeholder-gray-700 font-mono outline-none focus:border-red-400/50" />
+            <button type="submit" disabled={chPreviewing || chAdding || !chUrl.trim()}
+              className="px-4 py-2 rounded border border-red-400/40 text-red-400 text-xs font-bold hover:bg-red-400/10 transition-colors disabled:opacity-40 flex items-center gap-1">
+              {chPreviewing ? <><Spinner sm />Loading…</> : "Preview"}
+            </button>
+          </div>
+          {chError && <p className="text-xs text-accent-red">{chError}</p>}
+        </form>
+
+        {/* Step 2: Video selection panel */}
+        {chPreview && (
+          <div className="border border-red-400/20 rounded bg-surface-1 p-4 space-y-3">
+            <div className="flex items-center justify-between">
+              <div>
+                <span className="text-xs font-bold text-gray-200">{chPreview.name}</span>
+                <span className="ml-2 text-xs text-gray-600">{chPreview.videos.length} recent videos</span>
+              </div>
+              <div className="flex items-center gap-3">
+                <button onClick={() => toggleAllVideos(true)}
+                  className="text-xs text-gray-500 hover:text-gray-300 transition-colors">Select all</button>
+                <span className="text-gray-700">·</span>
+                <button onClick={() => toggleAllVideos(false)}
+                  className="text-xs text-gray-500 hover:text-gray-300 transition-colors">None</button>
+                <button onClick={() => { setChPreview(null); setChSelected(new Set()); }}
+                  className="text-xs text-gray-700 hover:text-accent-red transition-colors ml-2">✕ Cancel</button>
+              </div>
+            </div>
+
+            {/* Video list with checkboxes */}
+            <div className="space-y-1 max-h-64 overflow-y-auto pr-1">
+              {chPreview.videos.map(v => (
+                <label key={v.url}
+                  className="flex items-start gap-2 px-2 py-1.5 rounded hover:bg-white/5 cursor-pointer group">
+                  <input type="checkbox" checked={chSelected.has(v.url)}
+                    onChange={() => toggleVideo(v.url)}
+                    className="mt-0.5 flex-shrink-0 accent-red-400" />
+                  <div className="min-w-0">
+                    <p className="text-xs text-gray-300 group-hover:text-gray-100 transition-colors leading-snug">{v.title}</p>
+                    {v.published && (
+                      <p className="text-xs text-gray-700 mt-0.5">
+                        {new Date(v.published).toLocaleDateString()}
+                      </p>
+                    )}
+                  </div>
+                </label>
+              ))}
+            </div>
+
+            {/* Subscribe actions */}
+            <div className="flex items-center gap-3 pt-1 border-t border-border">
+              <button onClick={() => handleChSubscribe(true)} disabled={chAdding}
+                className="px-4 py-2 rounded border border-red-400/40 text-red-400 text-xs font-bold hover:bg-red-400/10 transition-colors disabled:opacity-40 flex items-center gap-1">
+                {chAdding ? <><Spinner sm />Subscribing…</> : `Subscribe & analyze ${chSelected.size} selected`}
+              </button>
+              <button onClick={() => handleChSubscribe(false)} disabled={chAdding}
+                className="px-3 py-2 rounded border border-border text-xs text-gray-500 hover:text-gray-300 hover:border-gray-600 transition-colors disabled:opacity-40">
+                Subscribe only (no backfill)
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Subscribed channel list */}
+        {chLoading ? (
+          <div className="flex items-center gap-2 text-sm text-gray-700"><Spinner /><span>Loading…</span></div>
+        ) : channels.length === 0 ? (
+          <div className="text-xs text-gray-700 mt-4">No subscriptions yet. Preview a channel above to subscribe.</div>
+        ) : (
+          <div className="space-y-2">
+            {channels.map(ch => (
+              <div key={ch.id} className="flex items-center justify-between gap-3 px-4 py-3 rounded border border-border bg-surface-1">
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-semibold text-gray-200 truncate">{ch.name || ch.channel_id}</span>
+                    <span className="flex-shrink-0 px-1.5 py-0.5 rounded border border-red-400/40 bg-red-400/10 text-red-400 text-xs font-bold">🎥 YT</span>
+                  </div>
+                  {ch.name && <p className="text-xs text-gray-600 font-mono truncate mt-0.5">{ch.channel_url}</p>}
+                  <p className="text-xs text-gray-700 mt-0.5">
+                    {ch.last_checked
+                      ? `Last checked: ${new Date(ch.last_checked).toLocaleString()}`
+                      : "Not yet checked"}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2 flex-shrink-0">
+                  {chPollResult[ch.id] != null && (
+                    <span className={`text-xs ${chPollResult[ch.id] < 0 ? "text-accent-red" : "text-accent-green"}`}>
+                      {chPollResult[ch.id] < 0 ? "Error" : `+${chPollResult[ch.id]} new`}
+                    </span>
+                  )}
+                  <button onClick={() => handleChPoll(ch.id)} disabled={chPolling[ch.id]}
+                    className="px-2 py-1 rounded border border-border text-xs text-gray-500 hover:text-accent-blue hover:border-accent-blue/40 transition-colors disabled:opacity-40 flex items-center gap-1">
+                    {chPolling[ch.id] ? <><Spinner sm />Polling…</> : "↻ Poll now"}
+                  </button>
+                  <button onClick={() => handleChDelete(ch.id)}
+                    className="text-xs text-gray-700 hover:text-accent-red transition-colors">✕</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ─── knowledge graph tab ──────────────────────────────────────────────────────
 
 function GraphTab() {
@@ -653,6 +1392,7 @@ function GraphTab() {
   const [tooltip, setTooltip]  = useState(null);
   const [selected, setSelected] = useState(null); // entry object for info panel
   const [nodeCount, setNodeCount] = useState({ entries: 0, tags: 0 });
+  const [tagSearch, setTagSearch] = useState("");
 
   useEffect(() => {
     fetch(`${API}/entries`)
@@ -671,8 +1411,15 @@ function GraphTab() {
     canvas.width  = W;
     canvas.height = H;
 
+    // Filter entries/tags by tagSearch
+    let filteredEntries = entries;
+    if (tagSearch.trim()) {
+      const tag = tagSearch.trim().toLowerCase();
+      filteredEntries = entries.filter(e => e.tags?.some(t => t.toLowerCase().includes(tag)));
+    }
+
     // Build nodes
-    const entryNodes = entries.map(e => ({
+    const entryNodes = filteredEntries.map(e => ({
       id:    `e-${e.id}`,
       kind:  "entry",
       entry: e,
@@ -682,7 +1429,7 @@ function GraphTab() {
     }));
 
     const tagCount = {};
-    entries.forEach(e => e.tags?.forEach(t => { tagCount[t] = (tagCount[t] || 0) + 1; }));
+    filteredEntries.forEach(e => e.tags?.forEach(t => { tagCount[t] = (tagCount[t] || 0) + 1; }));
 
     const tagNodes = Object.keys(tagCount).map(t => ({
       id:    `t-${t}`,
@@ -698,7 +1445,7 @@ function GraphTab() {
 
     const nodes = [...entryNodes, ...tagNodes];
     const links = [];
-    entries.forEach(e => {
+    filteredEntries.forEach(e => {
       e.tags?.forEach(t => {
         if (tagCount[t]) links.push({ source: `e-${e.id}`, target: `t-${t}` });
       });
@@ -895,7 +1642,7 @@ function GraphTab() {
       sim.stop();
       d3.select(canvas).on(".zoom", null);
     };
-  }, [entries]);
+  }, [entries, tagSearch]);
 
   return (
     <div className="relative w-full" style={{ height: "calc(100vh - 120px)" }}>
@@ -915,6 +1662,14 @@ function GraphTab() {
             <span className="w-2.5 h-2.5 rounded border border-border inline-block bg-surface-2 flex-shrink-0" />
             tag
           </span>
+          <input
+            type="text"
+            className="ml-4 px-2 py-0.5 rounded border border-border bg-surface-2 text-xs text-gray-500 font-mono"
+            placeholder="Search tag..."
+            value={tagSearch}
+            onChange={e => setTagSearch(e.target.value)}
+            style={{ minWidth: 90 }}
+          />
         </div>
       </div>
 
@@ -931,13 +1686,13 @@ function GraphTab() {
       {selected && (
         <div className="absolute bottom-4 left-4 right-4 sm:right-auto sm:w-80 bg-surface-1 border border-accent-blue/40 rounded-lg p-3 text-xs shadow-xl"
           style={{ zIndex: 10 }}>
-          <div className="flex items-center justify-between mb-2">
-            <div className="flex items-center gap-2">
+          <div className="flex items-start justify-between mb-2">
+            <div className="flex items-start gap-2 flex-1 min-w-0 mr-2">
               <Badge category={selected.category} />
-              <span className="text-gray-200 font-semibold truncate">{selected.name}</span>
+              <span className="text-gray-200 font-semibold break-words min-w-0">{selected.name}</span>
             </div>
             <button onClick={() => { selectedRef.current = null; setSelected(null); }}
-              className="text-gray-600 hover:text-gray-400 ml-2 flex-shrink-0">✕</button>
+              className="text-gray-600 hover:text-gray-400 flex-shrink-0">✕</button>
           </div>
           <ul className="space-y-1 mb-2">
             {selected.bullets.map((b, i) => (
@@ -977,16 +1732,23 @@ function parseUrls(raw) {
   )];
 }
 
-function AnalyzeTab({ input, setInput, loading, progress, onSubmit, onBlogSubmit, lists, onAddToList, onRemoveFromList, onUpdate, customCats = [] }) {
+function AnalyzeTab({ input, setInput, loading, progress, onSubmit, onBlogSubmit, onPdfSubmit, lists, onAddToList, onRemoveFromList, onUpdate, customCats = [] }) {
   const [blogInput,    setBlogInput]    = useState("");
   const [scanState,    setScanState]    = useState("idle"); // idle | scanning | results
   const [scanError,    setScanError]    = useState("");
   const [scanTitle,    setScanTitle]    = useState("");
   const [scanLinks,    setScanLinks]    = useState([]); // [{url, title, selected}]
+  const [pdfFile,      setPdfFile]      = useState(null);
   const urls   = parseUrls(input);
   const isBulk = urls.length > 1;
   const done   = progress.filter(p => p.status !== "pending").length;
   const total  = progress.length;
+
+  function handleFormSubmit(e) {
+    e.preventDefault();
+    if (pdfFile) { onPdfSubmit(pdfFile); }
+    else         { onSubmit(e); }
+  }
 
   async function handleScan(e) {
     e.preventDefault();
@@ -1034,9 +1796,9 @@ function AnalyzeTab({ input, setInput, loading, progress, onSubmit, onBlogSubmit
       <div className="flex gap-5">
         {/* LEFT: regular URL input */}
         <div className="flex-1 min-w-0">
-          <form onSubmit={onSubmit} className="flex flex-col gap-2">
+          <form onSubmit={handleFormSubmit} className="flex flex-col gap-2">
             <div className="relative bg-surface-1 border border-border rounded focus-within:border-accent-green/50 transition-colors">
-              <textarea value={input} onChange={e => setInput(e.target.value)}
+              <textarea value={input} onChange={e => { setInput(e.target.value); setPdfFile(null); }}
                 placeholder={"Paste one or more URLs (one per line):\nhttps://github.com/...\nhttps://blog.example.com/..."}
                 disabled={loading}
                 rows={Math.min(Math.max(urls.length + 1, 2), 8)}
@@ -1048,17 +1810,40 @@ function AnalyzeTab({ input, setInput, loading, progress, onSubmit, onBlogSubmit
               )}
             </div>
             <div className="flex items-center gap-3">
-              <button type="submit" disabled={loading || urls.length === 0}
+              <button type="submit" disabled={loading || (!pdfFile && urls.length === 0)}
                 className="px-5 py-2 rounded text-sm font-bold bg-accent-green/10 text-accent-green border border-accent-green/40
                            hover:bg-accent-green/20 disabled:opacity-30 disabled:cursor-not-allowed transition-colors flex items-center gap-2">
                 {loading && <Spinner sm />}
-                {loading ? (isBulk ? `Analyzing ${done}/${total}…` : "Analyzing…") : (isBulk ? `[ ANALYZE ${urls.length} ]` : "[ ANALYZE ]")}
+                {loading
+                  ? (pdfFile ? "Analyzing PDF…" : (isBulk ? `Analyzing ${done}/${total}…` : "Analyzing…"))
+                  : (pdfFile ? `[ ANALYZE PDF ]` : (isBulk ? `[ ANALYZE ${urls.length} ]` : "[ ANALYZE ]"))}
               </button>
               {loading && isBulk && (
                 <div className="flex-1 h-1.5 bg-surface-2 rounded-full overflow-hidden">
                   <div className="h-full bg-accent-green transition-all duration-300"
                     style={{ width: `${total ? (done / total) * 100 : 0}%` }} />
                 </div>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              <label className={`flex items-center gap-2 cursor-pointer select-none text-xs transition-colors ${
+                pdfFile ? "text-accent-green" : "text-gray-600 hover:text-gray-400"
+              } ${loading ? "opacity-40 pointer-events-none" : ""}` }>
+                <input type="file" accept=".pdf" className="hidden" disabled={loading}
+                  onChange={e => {
+                    const f = e.target.files?.[0];
+                    if (f) { setPdfFile(f); setInput(""); }
+                    e.target.value = "";
+                  }} />
+                <span className="px-3 py-1.5 rounded border border-border bg-surface-1 hover:border-gray-500 transition-colors whitespace-nowrap overflow-hidden max-w-xs text-ellipsis">
+                  📄 {pdfFile ? pdfFile.name : "Upload PDF"}
+                </span>
+              </label>
+              {pdfFile && (
+                <button type="button" onClick={() => setPdfFile(null)} disabled={loading}
+                  className="text-xs text-gray-700 hover:text-accent-red transition-colors disabled:opacity-30">
+                  ✕
+                </button>
               )}
             </div>
           </form>
@@ -1168,6 +1953,7 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
   const [showCatManager, setShowCatManager] = useState(false);
   const [newCatLabel, setNewCatLabel]       = useState("");
   const [newCatColor, setNewCatColor]       = useState("#58a6ff");
+  const [sourceFilter, setSourceFilter]     = useState("all"); // "all" | "manual" | "rss"
 
   const CAT_PALETTE = ["#3fb950","#58a6ff","#22d3ee","#fb923c","#bc8cff","#f85149","#d29922","#fb7185","#34d399","#f97316","#a78bfa","#94a3b8"];
 
@@ -1197,6 +1983,7 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
       if (category !== "all") p.set("category", category);
       if (debouncedSearch)    p.set("search", debouncedSearch);
       if (activeTag)          p.set("tag", activeTag);
+      if (sourceFilter !== "all") p.set("source", sourceFilter);
       const smart = SMART_LISTS.find(s => s.id === activeList);
       if (smart) {
         Object.entries(smart.param).forEach(([k, v]) => p.set(k, v));
@@ -1207,7 +1994,7 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
       setEntries(await res.json());
     } catch (e) { console.error(e); }
     finally { setLoading(false); }
-  }, [semanticMode, category, debouncedSearch, activeTag, activeList, refreshKey]);
+  }, [semanticMode, category, debouncedSearch, activeTag, activeList, sourceFilter, refreshKey]);
 
   // Semantic search effect
   useEffect(() => {
@@ -1229,6 +2016,46 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
   useEffect(() => { fetchEntries(); }, [fetchEntries]);
   useEffect(() => { fetchTags(); },   [fetchTags]);
 
+  // Use allTags (from /tags, includes children) so child-only tags appear in the cloud
+  const tagCounts = useMemo(() => {
+    const counts = {};
+    for (const { tag, count } of allTags) {
+      counts[tag] = count;
+    }
+    return counts;
+  }, [allTags]);
+
+  const activeFilters = useMemo(() => {
+    const filters = [];
+    if (debouncedSearch) {
+      filters.push({
+        key: "search",
+        label: `Search: ${debouncedSearch}`,
+        onClear: () => { setSearch(""); setDebounced(""); },
+      });
+    }
+    if (semanticMode) {
+      filters.push({ key: "semantic", label: "Semantic", onClear: () => setSemanticMode(false) });
+    }
+    if (category !== "all") {
+      const label = CAT_META[category]?.label || category;
+      filters.push({ key: "category", label: `Category: ${label}`, onClear: () => setCategory("all") });
+    }
+    if (activeTag) {
+      filters.push({ key: "tag", label: `Tag: ${activeTag}`, onClear: () => setActiveTag("") });
+    }
+    if (sourceFilter !== "all") {
+      const label = sourceFilter === "rss" ? "RSS" : "Manual";
+      filters.push({ key: "source", label: `Source: ${label}`, onClear: () => setSourceFilter("all") });
+    }
+    if (activeList) {
+      const smart = SMART_LISTS.find(s => s.id === activeList);
+      const label = smart ? smart.label : (lists.find(l => l.id === activeList)?.name || "List");
+      filters.push({ key: "list", label: `List: ${label}`, onClear: () => setActiveList(null) });
+    }
+    return filters;
+  }, [debouncedSearch, semanticMode, category, activeTag, sourceFilter, activeList, lists]);
+
   async function toggleRead(id) {
     await fetch(`${API}/entries/${id}/read`, { method: "PATCH" });
     setEntries(prev => prev.map(e => e.id === id ? { ...e, read: !e.read } : e));
@@ -1243,6 +2070,7 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
   function handleUpdate(updated) {
     setEntries(prev => prev.map(e => e.id === updated.id ? { ...e, ...updated } : e));
     onUpdate?.(updated);
+    fetchTags();
   }
 
   async function handleEmbedAll() {
@@ -1297,6 +2125,16 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
     ));
     setEntries(prev => prev.map(e => selectedIds.has(e.id) ? { ...e, useful: true } : e));
     setSelectedIds(new Set());
+  }
+
+  async function bulkDeleteSelected() {
+    if (!window.confirm(`Delete ${selectedIds.size} selected entr${selectedIds.size === 1 ? "y" : "ies"}?`)) return;
+    await Promise.all([...selectedIds].map(eid =>
+      fetch(`${API}/entries/${eid}`, { method: "DELETE" })
+    ));
+    setEntries(prev => prev.filter(e => !selectedIds.has(e.id)));
+    setSelectedIds(new Set());
+    fetchTags();
   }
 
   async function createList(name) {
@@ -1401,21 +2239,22 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
             onAddToList={bulkAddToList}
             onMarkRead={bulkMarkRead}
             onMarkUseful={bulkMarkUseful}
+            onDeleteSelected={bulkDeleteSelected}
             onClear={() => setSelectedIds(new Set())} />
         )}
 
         {/* search + semantic toggle */}
-        <div className="flex flex-col sm:flex-row gap-3 mb-3">
-          <div className={`flex items-center gap-2 bg-surface-1 border rounded px-3 py-2 flex-1 transition-colors
-            ${semanticMode ? "border-accent-purple/50 focus-within:border-accent-purple/70" : "border-border focus-within:border-accent-green/50"}`}>
-            <span className="text-gray-700 text-xs">{semanticMode ? "✦" : "⌕"}</span>
-            <input value={search} onChange={e => setSearch(e.target.value)}
-              placeholder={semanticMode ? "Describe what you're looking for…" : "Search names, bullets, tags…"}
-              className="flex-1 bg-transparent text-sm text-gray-200 placeholder-gray-700 outline-none font-mono" />
-            {(loading || semanticLoading) && <Spinner sm />}
-            {search && <button onClick={() => setSearch("")} className="text-gray-600 hover:text-gray-400 text-xs">✕</button>}
-          </div>
-          <div className="flex items-center gap-1 flex-wrap">
+        <div className="flex flex-col gap-3 mb-3">
+          <div className="flex flex-col sm:flex-row gap-3">
+            <div className={`flex items-center gap-2 bg-surface-1 border rounded px-3 py-2 flex-1 transition-colors
+              ${semanticMode ? "border-accent-purple/50 focus-within:border-accent-purple/70" : "border-border focus-within:border-accent-green/50"}`}>
+              <span className="text-gray-700 text-xs">{semanticMode ? "✦" : "⌕"}</span>
+              <input value={search} onChange={e => setSearch(e.target.value)}
+                placeholder={semanticMode ? "Describe what you're looking for…" : "Search names, bullets, tags…"}
+                className="flex-1 bg-transparent text-sm text-gray-200 placeholder-gray-700 outline-none font-mono" />
+              {(loading || semanticLoading) && <Spinner sm />}
+              {search && <button onClick={() => setSearch("")} className="text-gray-600 hover:text-gray-400 text-xs">✕</button>}
+            </div>
             <button onClick={() => { setSemanticMode(s => !s); setEntries([]); }}
               title="Toggle semantic / embedding-based search"
               className={`px-3 py-1.5 rounded text-xs font-bold border transition-colors flex items-center gap-1.5
@@ -1424,44 +2263,95 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
                   : "text-gray-600 border-border hover:text-gray-400 hover:border-gray-600"}`}>
               ✦ Semantic
             </button>
-            {!semanticMode && CATEGORIES.map(cat => {
-              const active = category === cat;
-              const meta   = CAT_META[cat];
-              const count  = cat === "all" ? entries.length : (catCounts[cat] || 0);
-              return (
-                <button key={cat} onClick={() => setCategory(cat)}
-                  className={`px-3 py-1.5 rounded text-xs font-bold uppercase tracking-wider border transition-colors
-                    ${active ? (meta ? meta.color : "text-gray-200 border-gray-500 bg-surface-2") : "text-gray-600 border-border hover:border-gray-500 hover:text-gray-400"}`}>
-                  {cat === "all" ? "All" : meta?.label}{count > 0 ? ` ${count}` : ""}
+          </div>
+
+          {/* active filters */}
+          {activeFilters.length > 0 && (
+            <div className="flex flex-wrap items-center gap-2 mb-2">
+              {activeFilters.map(f => (
+                <button key={f.key}
+                  onClick={f.onClear}
+                  className="flex items-center gap-1 text-xs px-2 py-1 rounded bg-surface-2 text-gray-200 hover:bg-surface-3">
+                  {f.label} <span className="text-gray-500">✕</span>
                 </button>
-              );
-            })}
-            {!semanticMode && customCats.map(c => {
-              const active = category === c.slug;
-              const count  = catCounts[c.slug] || 0;
-              return (
-                <button key={c.slug} onClick={() => setCategory(c.slug)}
-                  style={active ? { color: c.color, borderColor: c.color + "66", backgroundColor: c.color + "1a" } : {}}
-                  className={`px-3 py-1.5 rounded text-xs font-bold uppercase tracking-wider border transition-colors
-                    ${active ? "" : "text-gray-600 border-border hover:border-gray-500 hover:text-gray-400"}`}>
-                  {c.label}{count > 0 ? ` ${count}` : ""}
-                </button>
-              );
-            })}
-            {!semanticMode && (
+              ))}
+              <button onClick={() => {
+                  setSearch(""); setDebounced(""); setSemanticMode(false);
+                  setCategory("all"); setActiveTag(""); setSourceFilter("all"); setActiveList(null);
+                }}
+                className="ml-auto text-xs text-gray-400 hover:text-gray-200">
+                clear all
+              </button>
+            </div>
+          )}
+
+          {/* source + category filters */}
+          <div className="flex flex-col sm:flex-row gap-3">
+            <div className="flex flex-col sm:flex-row items-center gap-2">
+              <span className="text-xs font-semibold text-gray-400">Source:</span>
+              <div className="flex items-center border border-border rounded overflow-hidden">
+                {[ ["all", "All"], ["manual", "Manual"], ["rss", "RSS"] ].map(([val, label]) => (
+                  <button key={val} onClick={() => setSourceFilter(val)}
+                    className={`px-2.5 py-1.5 text-xs font-bold transition-colors
+                      ${sourceFilter === val
+                        ? "bg-surface-2 text-gray-200 border-r border-border last:border-r-0"
+                        : "text-gray-600 hover:text-gray-400 border-r border-border last:border-r-0"}`}>
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="flex-1 flex flex-wrap gap-2 items-center">
+              <span className="text-xs font-semibold text-gray-400">Category:</span>
+              <div className="flex flex-wrap gap-1">
+                {CATEGORIES.map(cat => {
+                  const active = category === cat;
+                  const meta   = CAT_META[cat];
+                  const count  = cat === "all" ? entries.length : (catCounts[cat] || 0);
+                  return (
+                    <button key={cat} onClick={() => setCategory(cat)}
+                      className={`px-3 py-1.5 rounded text-xs font-bold uppercase tracking-wider border transition-colors
+                        ${active ? (meta ? meta.color : "text-gray-200 border-gray-500 bg-surface-2") : "text-gray-600 border-border hover:border-gray-500 hover:text-gray-400"}`}>
+                      {cat === "all" ? "All" : meta?.label}{count > 0 ? ` ${count}` : ""}
+                    </button>
+                  );
+                })}
+                {customCats.map(c => {
+                  const active = category === c.slug;
+                  const count  = catCounts[c.slug] || 0;
+                  return (
+                    <button key={c.slug} onClick={() => setCategory(c.slug)}
+                      style={active ? { color: c.color, borderColor: c.color + "66", backgroundColor: c.color + "1a" } : {}}
+                      className={`px-3 py-1.5 rounded text-xs font-bold uppercase tracking-wider border transition-colors
+                        ${active ? "" : "text-gray-600 border-border hover:border-gray-500 hover:text-gray-400"}`}>
+                      {c.label}{count > 0 ? ` ${count}` : ""}
+                    </button>
+                  );
+                })}
+              </div>
               <button onClick={() => setShowCatManager(s => !s)}
                 title="Manage custom categories"
                 className={`px-2 py-1.5 rounded text-xs border transition-colors
                   ${showCatManager ? "text-gray-300 border-gray-500 bg-surface-2" : "text-gray-600 border-border hover:border-gray-500 hover:text-gray-400"}`}>
                 ⊕
               </button>
-            )}
+            </div>
           </div>
         </div>
 
         {/* custom category manager */}
         {showCatManager && (
           <div className="mb-3 p-3 rounded border border-border bg-surface-1 space-y-3">
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="text-xs font-bold text-gray-200">Custom categories</div>
+                <div className="text-xs text-gray-500">Create your own category tags to group entries.</div>
+              </div>
+              <button onClick={() => setShowCatManager(false)}
+                className="text-xs text-gray-500 hover:text-gray-300">Close</button>
+            </div>
+
             {customCats.length > 0 && (
               <div className="flex flex-wrap gap-2">
                 {customCats.map(c => (
@@ -1474,20 +2364,24 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
                 ))}
               </div>
             )}
-            <form onSubmit={handleAddCat} className="flex items-center gap-2 flex-wrap">
+
+            <form onSubmit={handleAddCat} className="flex flex-col sm:flex-row items-center gap-2">
               <input value={newCatLabel} onChange={e => setNewCatLabel(e.target.value)}
-                placeholder="Category name…"
-                className="bg-surface-2 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-700 outline-none focus:border-gray-500 w-36" />
-              <div className="flex gap-1">
-                {CAT_PALETTE.filter(col => !customCats.some(c => c.color === col)).map(col => (
-                  <button type="button" key={col} onClick={() => setNewCatColor(col)}
-                    style={{ backgroundColor: col, outline: newCatColor === col ? `2px solid ${col}` : "none", outlineOffset: "2px" }}
-                    className="w-4 h-4 rounded-full transition-transform hover:scale-110" />
-                ))}
+                placeholder="New category name…"
+                className="flex-1 bg-surface-2 border border-border rounded px-2 py-1 text-xs text-gray-200 placeholder-gray-700 outline-none focus:border-gray-500" />
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-gray-500">Color:</span>
+                <div className="flex gap-1">
+                  {CAT_PALETTE.filter(col => !customCats.some(c => c.color === col)).map(col => (
+                    <button type="button" key={col} onClick={() => setNewCatColor(col)}
+                      style={{ backgroundColor: col, outline: newCatColor === col ? `2px solid ${col}` : "none", outlineOffset: "2px" }}
+                      className="w-4 h-4 rounded-full transition-transform hover:scale-110" />
+                  ))}
+                </div>
               </div>
               <button type="submit"
-                className="px-2 py-1 rounded text-xs border border-border text-gray-400 hover:text-gray-200 hover:border-gray-500 transition-colors">
-                + Add
+                className="px-3 py-1 rounded text-xs border border-border text-gray-400 hover:text-gray-200 hover:border-gray-500 transition-colors">
+                + Add category
               </button>
             </form>
           </div>
@@ -1556,11 +2450,14 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
               </div>
             )}
             {entries.map(entry => (
-              ["playlist", "list", "blog"].includes(entry.category)
+              ["playlist", "blog"].includes(entry.category)
                 ? <PlaylistCard key={entry.id} entry={entry}
                     onTagClick={t => setActiveTag(prev => prev === t ? "" : t)}
                     customCats={customCats}
-                    onDelete={id => setEntries(prev => prev.filter(e => e.id !== id))} />
+                    onDelete={id => setEntries(prev => prev.filter(e => e.id !== id))}
+                    onUpdate={handleUpdate}
+                    allTags={allTags}
+                    matchedChildIds={entry.matched_child_ids || []} />
                 : <EntryCard key={entry.id} entry={entry}
                     onToggleRead={toggleRead} onDelete={deleteEntry}
                     onTagClick={t => setActiveTag(prev => prev === t ? "" : t)}
@@ -1568,19 +2465,20 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
                     onUpdate={handleUpdate}
                     selected={selectedIds.has(entry.id)}
                     onSelect={toggleSelect}
-                    customCats={customCats} />
+                    customCats={customCats}
+                    allTags={allTags} />
             ))}
           </div>
         )}
       </div>
 
       {/* right sidebar: tag cloud */}
-      {allTags.length > 0 && (
+      {Object.keys(tagCounts).length > 0 && (
         <aside className="w-36 flex-shrink-0">
           <div className="sticky top-8">
             <p className="text-xs text-gray-700 uppercase tracking-widest mb-2">Tags</p>
             <div className="space-y-0.5">
-              {allTags.map(({ tag, count }) => (
+              {Object.entries(tagCounts).sort((a, b) => b[1] - a[1]).map(([tag, count]) => (
                 <button key={tag} onClick={() => setActiveTag(prev => prev === tag ? "" : tag)}
                   className={`w-full text-left px-2 py-1 rounded text-xs font-mono transition-colors truncate
                     ${activeTag === tag
@@ -1599,6 +2497,680 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
           </div>
         </aside>
       )}
+    </div>
+  );
+}
+
+// ─── chat ─────────────────────────────────────────────────────────────────────
+
+const CHAT_MODELS = [
+  { id: "gemini-2.5-flash", label: "2.5 Flash (fast)" },
+  { id: "gemini-2.5-pro",   label: "2.5 Pro (deep)" },
+  { id: "gemini-1.5-flash", label: "1.5 Flash" },
+  { id: "gemini-1.5-pro",   label: "1.5 Pro" },
+];
+
+function escapeHtml(unsafe) {
+  return unsafe
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function renderMarkdown(md) {
+  if (!md) return "";
+
+  // Split on fenced code blocks (```lang\n...```)
+  const parts = md.split(/```([\w-]*)\n([\s\S]*?)```/g);
+  let html = "";
+
+  for (let i = 0; i < parts.length; i += 3) {
+    const before = parts[i];
+    const lang   = parts[i + 1];
+    const code   = parts[i + 2];
+
+    if (before) html += renderMarkdownChunk(before);
+    if (code !== undefined) {
+      const escaped = escapeHtml(code);
+      const cls = lang ? `language-${lang}` : "";
+      html += `<pre class='bg-surface-2 p-2 rounded text-[11px] overflow-x-auto'><code class='${cls}'>${escaped}</code></pre>`;
+    }
+  }
+
+  return html;
+}
+
+function renderMarkdownChunk(text) {
+  const inline = (t) => {
+    let x = escapeHtml(t);
+    x = x.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+    x = x.replace(/\*(.+?)\*/g, "<em>$1</em>");
+    x = x.replace(/`([^`]+)`/g, "<code class='bg-surface-2 px-1 rounded'>$1</code>");
+    x = x.replace(/\[([^\]]+)\]\(([^\)]+)\)/g,
+      "<a href='$2' target='_blank' rel='noopener noreferrer' class='text-accent-blue hover:underline'>$1</a>");
+    return x;
+  };
+
+  const lines = text.split(/\r?\n/);
+  let html = "";
+  let inUL = false;
+  let inOL = false;
+
+  const closeLists = () => {
+    if (inUL) { html += "</ul>"; inUL = false; }
+    if (inOL) { html += "</ol>"; inOL = false; }
+  };
+
+  for (let line of lines) {
+    const trimmed = line.trim();
+    const h       = trimmed.match(/^(#{1,6})\s+(.*)$/);
+    const o       = trimmed.match(/^(\d+)\.\s+(.*)$/);
+    const u       = trimmed.match(/^[-*+]\s+(.*)$/);
+
+    if (h) {
+      closeLists();
+      const level = Math.min(6, h[1].length);
+      html += `<h${level} class='font-bold mt-3 mb-1 text-sm'>${inline(h[2])}</h${level}>`;
+    } else if (o) {
+      if (inUL) closeLists();
+      if (!inOL) { inOL = true; html += "<ol class='list-decimal list-inside mb-2'>"; }
+      html += `<li>${inline(o[2])}</li>`;
+    } else if (u) {
+      if (inOL) closeLists();
+      if (!inUL) { inUL = true; html += "<ul class='list-disc list-inside mb-2'>"; }
+      html += `<li>${inline(u[1])}</li>`;
+    } else {
+      if (!trimmed) {
+        closeLists();
+        html += "<br/>";
+      } else {
+        closeLists();
+        html += `<p class='mb-1'>${inline(trimmed)}</p>`;
+      }
+    }
+  }
+
+  closeLists();
+  return html;
+}
+
+function ChatTab() {
+  const [sessions,       setSessions]       = useState([]);
+  const [activeSession,  setActiveSession]  = useState(null);
+  const [messages,       setMessages]       = useState([]);
+  const [chatInput,      setChatInput]      = useState("");
+  const [chatLoading,    setChatLoading]    = useState(false);
+  const [model,          setModel]          = useState("gemini-2.5-flash");
+  const [renamingId,     setRenamingId]     = useState(null);
+  const [renameVal,      setRenameVal]      = useState("");
+  // Pinned entries & autocomplete
+  const [pinnedEntries,  setPinnedEntries]  = useState([]);
+  const [mention,        setMention]        = useState(null);   // string being typed after @
+  const [suggestions,    setSuggestions]    = useState([]);
+  const [suggestionIdx,  setSuggestionIdx]  = useState(0);
+  // Browse modal
+  const [showBrowse,     setShowBrowse]     = useState(false);
+  const [browseSearch,   setBrowseSearch]   = useState("");
+  const [browseResults,  setBrowseResults]  = useState([]);
+
+  const bottomRef   = useRef(null);
+  const textareaRef = useRef(null);
+
+  // Load sessions on mount
+  useEffect(() => {
+    fetch(`${API}/chat/sessions`).then(r => r.json()).then(setSessions).catch(console.error);
+  }, []);
+
+  // Auto-scroll to bottom when messages change
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  // Autocomplete: fetch suggestions when mention query changes
+  useEffect(() => {
+    if (mention === null || mention === undefined) { setSuggestions([]); return; }
+    const q = mention.trim();
+    if (!q) { setSuggestions([]); return; }
+    fetch(`${API}/entries/search?q=${encodeURIComponent(q)}`)
+      .then(r => r.json())
+      .then(rows => { setSuggestions(rows); setSuggestionIdx(0); })
+      .catch(() => setSuggestions([]));
+  }, [mention]);
+
+  // Browse modal: search entries
+  useEffect(() => {
+    if (!showBrowse) return;
+    const q = browseSearch.trim();
+    fetch(`${API}/entries/search?q=${encodeURIComponent(q || " ")}`)
+      .then(r => r.json())
+      .then(setBrowseResults)
+      .catch(() => setBrowseResults([]));
+  }, [showBrowse, browseSearch]);
+
+  async function loadSession(session) {
+    setActiveSession(session);
+    setModel(session.model || "gemini-2.5-flash");
+    setPinnedEntries([]);
+    const msgs = await fetch(`${API}/chat/sessions/${session.id}/messages`)
+      .then(r => r.json()).catch(() => []);
+    setMessages(msgs.map(m => ({ ...m, sources: m.sources || [] })));
+  }
+
+  async function newChat() {
+    setActiveSession(null);
+    setMessages([]);
+    setChatInput("");
+    setPinnedEntries([]);
+  }
+
+  async function deleteSession(e, id) {
+    e.stopPropagation();
+    await fetch(`${API}/chat/sessions/${id}`, { method: "DELETE" });
+    setSessions(prev => prev.filter(s => s.id !== id));
+    if (activeSession?.id === id) { setActiveSession(null); setMessages([]); }
+  }
+
+  async function saveRename(id) {
+    const title = renameVal.trim();
+    if (!title) { setRenamingId(null); return; }
+    await fetch(`${API}/chat/sessions/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title }),
+    });
+    setSessions(prev => prev.map(s => s.id === id ? { ...s, title } : s));
+    setRenamingId(null);
+  }
+
+  function addPin(entry) {
+    setPinnedEntries(prev => prev.find(p => p.id === entry.id) ? prev : [...prev, entry]);
+  }
+  function removePin(id) {
+    setPinnedEntries(prev => prev.filter(p => p.id !== id));
+  }
+
+  function pickSuggestion(entry) {
+    // Replace the @query in the textarea with just the trimmed text (no @)
+    const val = chatInput;
+    const replaced = val.replace(/@([\w\s\-.]*)$/, "");
+    setChatInput(replaced);
+    setMention(null);
+    setSuggestions([]);
+    addPin(entry);
+    textareaRef.current?.focus();
+  }
+
+  function handleInputChange(e) {
+    const val = e.target.value;
+    setChatInput(val);
+    // Detect @mention trigger: look for @ followed by text at end of string
+    const m = val.match(/@([\w\s\-.]*)$/);
+    if (m) {
+      setMention(m[1]);
+    } else {
+      setMention(null);
+      setSuggestions([]);
+    }
+  }
+
+  async function sendMessage() {
+    const question = chatInput.trim();
+    if (!question || chatLoading) return;
+    setChatLoading(true);
+    setChatInput("");
+    setMention(null);
+    setSuggestions([]);
+
+    let session = activeSession;
+    if (!session) {
+      try {
+        const res = await fetch(`${API}/chat/sessions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model }),
+        });
+        session = await res.json();
+        setActiveSession(session);
+        setSessions(prev => [session, ...prev]);
+      } catch (err) {
+        setChatLoading(false);
+        return;
+      }
+    }
+
+    const pinnedLabels = pinnedEntries.map(p => `@${p.name}`).join(" ");
+    const displayText  = pinnedLabels ? `${pinnedLabels}\n${question}` : question;
+    const userMsg      = { role: "user",      text: displayText, sources: [], pinned: pinnedEntries.length > 0 };
+    const assistantMsg = { role: "assistant", text: "",          sources: [] };
+    setMessages(prev => [...prev, userMsg, assistantMsg]);
+
+    const body = { question, session_id: session.id, model };
+    if (pinnedEntries.length > 0) body.pinned_ids = pinnedEntries.map(p => p.id);
+
+    try {
+      const res = await fetch(`${API}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(errText || res.statusText || "Chat request failed");
+      }
+      if (!res.body) {
+        throw new Error("No response body from chat endpoint");
+      }
+      const reader  = res.body.getReader();
+      const decoder = new TextDecoder();
+      let   buffer  = "";
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop();
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let msg; try { msg = JSON.parse(line); } catch { continue; }
+          if (msg.type === "sources") {
+            setMessages(prev => {
+              const next = [...prev];
+              next[next.length - 1] = { ...next[next.length - 1], sources: msg.entries };
+              return next;
+            });
+          } else if (msg.type === "chunk") {
+            setMessages(prev => {
+              const next = [...prev];
+              next[next.length - 1] = { ...next[next.length - 1], text: next[next.length - 1].text + msg.text };
+              return next;
+            });
+          } else if (msg.type === "done") {
+            const newTitle = msg.title;
+            if (newTitle) {
+              setActiveSession(prev => ({ ...prev, title: newTitle }));
+              setSessions(prev => prev.map(s => s.id === session.id ? { ...s, title: newTitle, updated_at: new Date().toISOString() } : s));
+            }
+            fetch(`${API}/chat/sessions`).then(r => r.json()).then(setSessions).catch(console.error);
+          } else if (msg.type === "error") {
+            setMessages(prev => {
+              const next = [...prev];
+              next[next.length - 1] = { ...next[next.length - 1], text: `⚠ Error: ${msg.message}` };
+              return next;
+            });
+          }
+        }
+      }
+    } catch (err) {
+      setMessages(prev => {
+        const next = [...prev];
+        next[next.length - 1] = { ...next[next.length - 1], text: `⚠ ${err.message}` };
+        return next;
+      });
+    } finally {
+      setChatLoading(false);
+    }
+  }
+
+  function handleKeyDown(e) {
+    // Autocomplete navigation
+    if (suggestions.length > 0) {
+      if (e.key === "ArrowDown") { e.preventDefault(); setSuggestionIdx(i => Math.min(i + 1, suggestions.length - 1)); return; }
+      if (e.key === "ArrowUp")   { e.preventDefault(); setSuggestionIdx(i => Math.max(i - 1, 0)); return; }
+      if (e.key === "Enter" || e.key === "Tab") {
+        e.preventDefault();
+        if (suggestions[suggestionIdx]) pickSuggestion(suggestions[suggestionIdx]);
+        return;
+      }
+      if (e.key === "Escape") { setMention(null); setSuggestions([]); return; }
+    }
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+  }
+
+  return (
+    <div className="flex gap-0 h-[calc(100vh-7rem)]" style={{ minHeight: 0 }}>
+      {/* ── Sidebar ── */}
+      <aside className="w-56 flex-shrink-0 border-r border-border flex flex-col gap-0 pr-3">
+        <button onClick={newChat}
+          className="w-full mb-3 px-3 py-1.5 rounded border border-accent-green/40 bg-accent-green/10 text-accent-green text-xs font-bold uppercase tracking-wider hover:bg-accent-green/20 transition-colors">
+          + New Chat
+        </button>
+        <div className="overflow-y-auto flex-1 space-y-0.5">
+          {sessions.length === 0 && (
+            <p className="text-xs text-gray-700 px-1">No saved chats yet.</p>
+          )}
+          {sessions.map(s => (
+            <div key={s.id}
+              onClick={() => loadSession(s)}
+              className={`group flex items-center gap-1 px-2 py-1.5 rounded cursor-pointer text-xs transition-colors
+                ${activeSession?.id === s.id
+                  ? "bg-accent-green/10 text-accent-green border border-accent-green/30"
+                  : "text-gray-500 hover:text-gray-300 hover:bg-surface-1"}`}>
+              {renamingId === s.id ? (
+                <input autoFocus value={renameVal}
+                  onChange={e => setRenameVal(e.target.value)}
+                  onBlur={() => saveRename(s.id)}
+                  onKeyDown={e => { if (e.key === "Enter") saveRename(s.id); if (e.key === "Escape") setRenamingId(null); }}
+                  onClick={e => e.stopPropagation()}
+                  className="flex-1 bg-transparent border-b border-accent-green/50 outline-none text-xs text-gray-200 min-w-0" />
+              ) : (
+                <span className="flex-1 truncate"
+                  onDoubleClick={e => { e.stopPropagation(); setRenamingId(s.id); setRenameVal(s.title || ""); }}>
+                  {s.title || <span className="italic text-gray-700">Untitled</span>}
+                </span>
+              )}
+              <button onClick={e => deleteSession(e, s.id)}
+                className="opacity-0 group-hover:opacity-100 text-gray-700 hover:text-accent-red transition-all flex-shrink-0 text-[10px]">✕</button>
+            </div>
+          ))}
+        </div>
+      </aside>
+
+      {/* ── Chat area ── */}
+      <div className="flex-1 flex flex-col min-w-0 pl-4">
+        {/* Model picker */}
+        <div className="flex items-center gap-3 mb-3 flex-shrink-0">
+          <span className="text-xs text-gray-700 uppercase tracking-widest">Model</span>
+          <select value={model} onChange={e => setModel(e.target.value)}
+            disabled={!!activeSession}
+            className="bg-surface-1 border border-border text-gray-300 text-xs px-2 py-1 rounded outline-none disabled:opacity-50">
+            {CHAT_MODELS.map(m => (
+              <option key={m.id} value={m.id}>{m.label}</option>
+            ))}
+          </select>
+          {activeSession && (
+            <span className="text-[10px] text-gray-700">model locked to session — start a new chat to change</span>
+          )}
+        </div>
+
+        {/* Messages */}
+        <div className="flex-1 overflow-y-auto space-y-4 pr-1" style={{ minHeight: 0 }}>
+          {messages.length === 0 && (
+            <div className="text-center text-gray-700 text-sm mt-16">
+              <div className="text-3xl mb-3">⚔</div>
+              <p>Ask anything about your knowledge base.</p>
+              <p className="text-xs mt-1 text-gray-800">Answers are grounded in your saved articles and repos.</p>
+              <p className="text-xs mt-1 text-gray-800">Type <span className="text-accent-green font-mono">@</span> to pin specific articles as context.</p>
+            </div>
+          )}
+          {messages.map((msg, i) => (
+            <div key={i} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
+              <div className={`max-w-[80%] rounded-lg px-4 py-2.5 text-sm
+                ${msg.role === "user"
+                  ? "bg-accent-green/15 border border-accent-green/30 text-gray-200"
+                  : "bg-surface-1 border border-border text-gray-300"}`}>
+                {msg.role === "assistant" && (
+                  <div className="text-[10px] text-accent-green mb-1 font-bold tracking-widest">⚔ SAMURAIZER</div>
+                )}
+                {msg.text ? (
+                  <div
+                    className="text-xs leading-relaxed"
+                    dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.text) }}
+                  />
+                ) : msg.role === "assistant" ? (
+                  <div className="flex items-center gap-2 text-gray-700"><Spinner sm /><span className="text-xs">Thinking…</span></div>
+                ) : null}
+                {/* Source cards */}
+                {msg.role === "assistant" && msg.sources && msg.sources.length > 0 && (
+                  <div className="mt-3 pt-2 border-t border-border/50 space-y-1.5">
+                    <p className="text-[10px] text-gray-700 uppercase tracking-widest mb-1">Sources used</p>
+                    {msg.sources.map(src => (
+                      <div key={src.id} className="flex items-center gap-2 bg-surface rounded px-2 py-1">
+                        <a href={src.url} target="_blank" rel="noopener noreferrer"
+                          className="flex-1 text-[10px] text-accent-blue hover:underline truncate">{src.name}</a>
+                        {src.pinned ? (
+                          <span className="text-[9px] text-accent-yellow flex-shrink-0">📌 pinned</span>
+                        ) : (
+                          <div className="flex items-center gap-1 flex-shrink-0">
+                            <div className="w-12 h-1 rounded bg-border overflow-hidden">
+                              <div className="h-full bg-accent-green rounded" style={{ width: `${Math.round(src.score * 100)}%` }} />
+                            </div>
+                            <span className="text-[9px] text-gray-700">{Math.round(src.score * 100)}%</span>
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          ))}
+          <div ref={bottomRef} />
+        </div>
+
+        {/* Pinned entry chips */}
+        {pinnedEntries.length > 0 && (
+          <div className="flex-shrink-0 flex flex-wrap gap-1.5 mt-2 px-1">
+            {pinnedEntries.map(p => (
+              <span key={p.id}
+                className="inline-flex items-center gap-1 bg-accent-yellow/10 border border-accent-yellow/30 text-accent-yellow rounded px-2 py-0.5 text-[10px]">
+                📌 {p.name}
+                <button onClick={() => removePin(p.id)}
+                  className="ml-0.5 text-accent-yellow/60 hover:text-accent-yellow leading-none">✕</button>
+              </span>
+            ))}
+          </div>
+        )}
+
+        {/* Input bar */}
+        <div className="flex-shrink-0 mt-2 relative">
+          {/* Autocomplete dropdown */}
+          {suggestions.length > 0 && (
+            <div className="absolute bottom-full mb-1 left-0 right-0 z-50 bg-surface-1 border border-border rounded shadow-lg max-h-48 overflow-y-auto">
+              {suggestions.map((entry, idx) => (
+                <div key={entry.id}
+                  onMouseDown={e => { e.preventDefault(); pickSuggestion(entry); }}
+                  className={`px-3 py-2 cursor-pointer text-xs flex flex-col gap-0.5
+                    ${idx === suggestionIdx ? "bg-accent-green/15 text-accent-green" : "text-gray-300 hover:bg-surface"}`}>
+                  <span className="font-medium truncate">{entry.name}</span>
+                  <span className="text-[10px] text-gray-700 truncate">{entry.url}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="flex gap-2 items-end">
+            <textarea
+              ref={textareaRef}
+              value={chatInput}
+              onChange={handleInputChange}
+              onKeyDown={handleKeyDown}
+              disabled={chatLoading}
+              rows={2}
+              placeholder="Ask a question… (@ to pin articles, Enter to send)"
+              className="flex-1 bg-surface-1 border border-border rounded px-3 py-2 text-xs text-gray-200 placeholder-gray-700 outline-none focus:border-accent-green/50 resize-none disabled:opacity-50 font-mono" />
+            {/* @ browse button */}
+            <button onClick={() => { setShowBrowse(true); setBrowseSearch(""); }}
+              title="Browse entries to pin"
+              className="px-3 py-2 rounded bg-surface-1 border border-border text-accent-yellow text-xs hover:bg-accent-yellow/10 hover:border-accent-yellow/40 transition-colors flex-shrink-0 font-bold">
+              @
+            </button>
+            <button onClick={sendMessage} disabled={chatLoading || !chatInput.trim()}
+              className="px-4 py-2 rounded bg-accent-green/20 border border-accent-green/40 text-accent-green text-xs font-bold uppercase tracking-wider hover:bg-accent-green/30 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex-shrink-0">
+              {chatLoading ? <Spinner sm /> : "Send"}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Browse modal ── */}
+      {showBrowse && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
+          onClick={() => setShowBrowse(false)}>
+          <div className="bg-surface-1 border border-border rounded-lg shadow-2xl w-[520px] max-h-[70vh] flex flex-col"
+            onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between px-4 py-3 border-b border-border">
+              <span className="text-sm font-bold text-accent-green tracking-wider">Pin Articles to Chat</span>
+              <button onClick={() => setShowBrowse(false)} className="text-gray-700 hover:text-gray-300 text-xs">✕ Close</button>
+            </div>
+            <div className="px-4 py-2 border-b border-border">
+              <input autoFocus
+                value={browseSearch}
+                onChange={e => setBrowseSearch(e.target.value)}
+                placeholder="Search entries…"
+                className="w-full bg-surface border border-border rounded px-3 py-1.5 text-xs text-gray-200 outline-none focus:border-accent-green/50 placeholder-gray-700" />
+            </div>
+            <div className="flex-1 overflow-y-auto">
+              {browseResults.length === 0 && (
+                <p className="text-xs text-gray-700 text-center py-8">No entries found.</p>
+              )}
+              {browseResults.map(entry => {
+                const pinned = !!pinnedEntries.find(p => p.id === entry.id);
+                return (
+                  <div key={entry.id}
+                    className={`flex items-start gap-3 px-4 py-3 border-b border-border/40 cursor-pointer hover:bg-surface transition-colors
+                      ${pinned ? "bg-accent-yellow/5" : ""}`}
+                    onClick={() => { pinned ? removePin(entry.id) : addPin(entry); }}>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-medium text-gray-200 truncate">{entry.name}</p>
+                      <p className="text-[10px] text-gray-700 truncate">{entry.url}</p>
+                      {entry.category && (
+                        <span className="text-[9px] text-accent-blue mt-0.5 inline-block">{entry.category}</span>
+                      )}
+                    </div>
+                    <span className={`flex-shrink-0 text-[10px] font-bold px-2 py-0.5 rounded border
+                      ${pinned
+                        ? "bg-accent-yellow/15 border-accent-yellow/40 text-accent-yellow"
+                        : "bg-surface border-border text-gray-600"}`}>
+                      {pinned ? "📌 pinned" : "+ pin"}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+            <div className="px-4 py-2 border-t border-border flex items-center justify-between">
+              <span className="text-[10px] text-gray-700">{pinnedEntries.length} pinned</span>
+              <button onClick={() => setShowBrowse(false)}
+                className="px-3 py-1 rounded bg-accent-green/20 border border-accent-green/40 text-accent-green text-xs font-bold hover:bg-accent-green/30 transition-colors">
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── logs tab ─────────────────────────────────────────────────────────────────
+
+const LEVEL_STYLES = {
+  DEBUG:    { badge: "bg-gray-800 text-gray-500 border-gray-700",               row: "text-gray-600" },
+  INFO:     { badge: "bg-accent-green/10 text-accent-green border-accent-green/40",   row: "" },
+  WARNING:  { badge: "bg-accent-yellow/10 text-accent-yellow border-accent-yellow/40", row: "text-accent-yellow" },
+  ERROR:    { badge: "bg-red-900/30 text-red-400 border-red-600/40",             row: "text-red-400" },
+  CRITICAL: { badge: "bg-red-800/50 text-red-300 border-red-400/50",             row: "text-red-300 font-bold" },
+};
+
+// Minimum-level ordering — module-level constant, never stale inside closures
+const LEVEL_ORDER = { DEBUG: 10, INFO: 20, WARNING: 30, ERROR: 40, CRITICAL: 50 };
+const LEVELS      = ["ALL", "DEBUG", "INFO", "WARNING", "ERROR"];
+
+function LogsTab() {
+  const [logs, setLogs]             = useState([]);
+  const [levelFilter, setLevelFilter] = useState("ALL");
+  const [autoScroll, setAutoScroll]   = useState(true);
+  const lastIdRef  = useRef(0);
+  const bottomRef  = useRef(null);
+
+  async function fetchLogs(since) {
+    try {
+      const data = await (await fetch(`${API}/logs?since=${since}`)).json();
+      if (data.length) {
+        lastIdRef.current = data[data.length - 1].id;
+        setLogs(prev => [...prev, ...data]);
+      }
+    } catch { /* ignore network errors */ }
+  }
+
+  useEffect(() => {
+    fetchLogs(0);
+    const iv = setInterval(() => fetchLogs(lastIdRef.current), 3000);
+    return () => clearInterval(iv);
+  }, []);
+
+  useEffect(() => {
+    if (autoScroll && bottomRef.current) {
+      bottomRef.current.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [logs, autoScroll]);
+
+  async function handleClear() {
+    try {
+      await fetch(`${API}/logs`, { method: "DELETE" });
+      setLogs([]);
+      lastIdRef.current = 0;
+    } catch { /* ignore */ }
+  }
+
+  const counts = useMemo(() => {
+    const c = { ALL: logs.length, DEBUG: 0, INFO: 0, WARNING: 0, ERROR: 0 };
+    for (const l of logs) {
+      const ord = LEVEL_ORDER[l.level] ?? 20;
+      if (ord >= 10) c.DEBUG++;
+      if (ord >= 20) c.INFO++;
+      if (ord >= 30) c.WARNING++;
+      if (ord >= 40) c.ERROR++;
+    }
+    return c;
+  }, [logs]);
+
+  // Computed directly (no useMemo) so levelFilter is always the current render value
+  const minOrd  = levelFilter === "ALL" ? 0 : (LEVEL_ORDER[levelFilter] ?? 0);
+  const visible = levelFilter === "ALL"
+    ? logs
+    : logs.filter(l => (LEVEL_ORDER[l.level] ?? 20) >= minOrd);
+
+  const activeBtnCls = {
+    ALL:     "bg-accent-green/10 text-accent-green border-accent-green/40",
+    DEBUG:   "bg-gray-800 text-gray-300 border-gray-600",
+    INFO:    "bg-accent-green/10 text-accent-green border-accent-green/40",
+    WARNING: "bg-accent-yellow/10 text-accent-yellow border-accent-yellow/40",
+    ERROR:   "bg-red-900/30 text-red-400 border-red-500/40",
+  };
+
+  return (
+    <div className="flex flex-col gap-3" style={{ height: "calc(100vh - 8rem)" }}>
+      {/* toolbar */}
+      <div className="flex items-center gap-2 flex-wrap">
+        <div className="flex gap-1">
+          {LEVELS.map(lv => (
+            <button key={lv} onClick={() => setLevelFilter(lv)}
+              className={`px-2.5 py-0.5 rounded border text-xs font-bold uppercase tracking-wide transition-colors
+                ${levelFilter === lv ? activeBtnCls[lv] : "text-gray-600 border-gray-800 hover:text-gray-400 hover:border-gray-600"}`}>
+              {lv}
+              {counts[lv] != null && <span className="ml-1 opacity-60">{counts[lv]}</span>}
+            </button>
+          ))}
+        </div>
+        <label className="flex items-center gap-1.5 text-xs text-gray-500 cursor-pointer select-none ml-auto">
+          <input type="checkbox" checked={autoScroll} onChange={e => setAutoScroll(e.target.checked)}
+            className="accent-accent-green" />
+          Auto-scroll
+        </label>
+        <button onClick={handleClear}
+          className="px-3 py-1 rounded border border-red-800/50 text-red-500 text-xs hover:bg-red-900/20 transition-colors">
+          Clear
+        </button>
+      </div>
+
+      {/* log list */}
+      <div className="flex-1 overflow-y-auto border border-border rounded bg-surface-1 p-3 font-mono text-xs">
+        {visible.length === 0 && (
+          <div className="text-gray-700 text-center py-8">No log entries.</div>
+        )}
+        {visible.map(l => {
+          const sty = LEVEL_STYLES[l.level] || LEVEL_STYLES.INFO;
+          return (
+            <div key={l.id} className={`flex items-start gap-2 py-0.5 leading-snug ${sty.row}`}>
+              <span className="flex-shrink-0 text-gray-600 tabular-nums">{l.ts}</span>
+              <span className={`flex-shrink-0 px-1.5 rounded border text-[10px] font-bold uppercase leading-[1.4] ${sty.badge}`}>{l.level}</span>
+              <span className="flex-shrink-0 text-gray-700 max-w-[120px] truncate" title={l.name}>{l.name}</span>
+              <span className="break-all">{l.msg}</span>
+            </div>
+          );
+        })}
+        <div ref={bottomRef} />
+      </div>
     </div>
   );
 }
@@ -1689,6 +3261,45 @@ export default function App() {
     await handleSubmitUrls(urls);
   }
 
+  async function handlePdfSubmit(file) {
+    if (loading) return;
+    setLoading(true);
+    setProgress([{ url: file.name, status: "pending", logs: [] }]);
+    const formData = new FormData();
+    formData.append("file", file);
+    try {
+      const res     = await fetch(`${API}/analyze-pdf`, { method: "POST", body: formData });
+      const reader  = res.body.getReader();
+      const decoder = new TextDecoder();
+      let   buffer  = "";
+      while (true) {
+        const { value, done: sd } = await reader.read();
+        if (sd) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop();
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let msg; try { msg = JSON.parse(line); } catch { continue; }
+          setProgress(prev => prev.map(p => {
+            if (p.url !== msg.url) return p;
+            if (msg.log)   return { ...p, logs: [...p.logs, msg.log] };
+            if (msg.entry) return { ...p, status: "ok",    entry: msg.entry };
+            if (msg.error) return { ...p, status: "error", error: msg.error };
+            return p;
+          }));
+        }
+      }
+      setRefreshKey(k => k + 1);
+    } catch (err) {
+      setProgress(prev => prev.map(p =>
+        p.status === "pending" ? { ...p, status: "error", error: err.message } : p
+      ));
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function handleBlogSubmit(url, selectedUrls = null, listingTitle = null) {
     if (loading) return;
     setLoading(true);
@@ -1733,14 +3344,17 @@ export default function App() {
   return (
     <div className="min-h-screen bg-surface font-mono flex flex-col">
       <header className="border-b border-border bg-surface-1 flex-shrink-0">
-        <div className="max-w-5xl mx-auto px-6 h-12 flex items-center gap-3">
+        <div className="max-w-7xl mx-auto px-6 h-12 flex items-center gap-3">
           <span className="text-accent-green font-bold text-base tracking-tight select-none">⚔ SAMURAIZER</span>
           <span className="text-border select-none">│</span>
           <nav className="flex gap-1 ml-2">
             {[
               { id: "analyze", label: "Analyze" },
               { id: "kb",      label: "Knowledge Base" },
+              { id: "subscriptions", label: "Subscriptions" },
               { id: "graph",   label: "Graph" },
+              { id: "chat",    label: "💬 Chat" },
+              { id: "logs",    label: "Logs" },
             ].map(({ id, label }) => (
               <button key={id} onClick={() => setTab(id)}
                 className={`px-3 py-1 rounded text-xs font-bold uppercase tracking-wider transition-colors flex items-center gap-1.5
@@ -1758,10 +3372,11 @@ export default function App() {
         </div>
       </header>
 
-      <main className="flex-1 max-w-5xl mx-auto w-full px-6 py-8">
+      <main className="flex-1 max-w-7xl mx-auto w-full px-6 py-8">
         {tab === "analyze" && (
           <AnalyzeTab input={input} setInput={handleInputChange}
             loading={loading} progress={progress} onSubmit={handleSubmit} onBlogSubmit={handleBlogSubmit}
+            onPdfSubmit={handlePdfSubmit}
             lists={lists} onAddToList={handleAddToList} onRemoveFromList={handleRemoveFromList}
             customCats={customCats}
             onUpdate={updated => setProgress(prev => prev.map(p =>
@@ -1769,15 +3384,20 @@ export default function App() {
             ))} />
         )}
         {tab === "kb" && (
-          <KnowledgeBaseTab refreshKey={refreshKey}
-            lists={lists} onListsChange={setLists}
-            onAddToList={handleAddToList} onRemoveFromList={handleRemoveFromList}
-            customCats={customCats} onCustomCatsChange={setCustomCats}
-            onUpdate={updated => setProgress(prev => prev.map(p =>
-              p.entry?.id === updated.id ? { ...p, entry: { ...p.entry, ...updated } } : p
-            ))} />
+          <ErrorBoundary>
+            <KnowledgeBaseTab refreshKey={refreshKey}
+              lists={lists} onListsChange={setLists}
+              onAddToList={handleAddToList} onRemoveFromList={handleRemoveFromList}
+              customCats={customCats} onCustomCatsChange={setCustomCats}
+              onUpdate={updated => setProgress(prev => prev.map(p =>
+                p.entry?.id === updated.id ? { ...p, entry: { ...p.entry, ...updated } } : p
+              ))} />
+          </ErrorBoundary>
         )}
+        {tab === "subscriptions" && <RssTab />}
         {tab === "graph" && <GraphTab />}
+        {tab === "chat" && <ChatTab />}
+        {tab === "logs" && <LogsTab />}
       </main>
     </div>
   );
