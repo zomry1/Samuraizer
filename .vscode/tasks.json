@@ -7,6 +7,19 @@
       "command": ".\\.venv\\Scripts\\python.exe server.py",
       "group": {
         "kind": "build",
+ "isDefault": false
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "panel": "new"
+      }
+    },
+    {
+      "label": "Start Backend Server (debugpy)",
+      "type": "shell",
+      "command": ".\\.venv\\Scripts\\python.exe -m debugpy --listen 5678 --wait-for-client server.py",
+      "group": {
+        "kind": "build",
         "isDefault": false
       },
       "problemMatcher": [],

@@ -4,6 +4,7 @@ feedparser
 trafilatura
 lxml_html_clean
 requests
+ollama
 google-genai
 python-dotenv
 python-telegram-bot[job-queue]>=21.0

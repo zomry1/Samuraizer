@@ -14,10 +14,12 @@ import hashlib
 import logging
 import threading
 import collections
+import subprocess
 import requests
 import trafilatura
 import feedparser
 import json_repair
+import ollama as _ollama_mod
 from urllib.parse import urlparse, urljoin
 import fitz  # PyMuPDF
 from scrapling import Fetcher as ScraplingFetcher
@@ -42,6 +44,8 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
+ollama_logger = logging.getLogger("ollama")
+ollama_logger.setLevel(logging.DEBUG)
 
 # ---------------------------------------------------------------------------
 # In-memory log ring-buffer (exposed via GET /logs)
@@ -80,6 +84,16 @@ class _MemoryLogHandler(logging.Handler):
 
 _mem_log = _MemoryLogHandler()
 logging.getLogger().addHandler(_mem_log)
+
+# Re-embed (embed-all) progress status, to support polling from UI.
+_embed_all_status = {
+    "active": False,
+    "done": 0,
+    "total": 0,
+    "failed": 0,
+    "message": "",
+    "updated_at": None,
+}
 
 app = Flask(__name__)
 DB_PATH = os.path.join(os.path.dirname(__file__), "samuraizer.db")
@@ -129,8 +143,10 @@ def _start_backup_scheduler(interval_hours: int = 12):
 
 def get_db():
     if "db" not in g:
-        g.db = sqlite3.connect(DB_PATH)
+        g.db = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
         g.db.row_factory = sqlite3.Row
+        g.db.execute("PRAGMA journal_mode=WAL")
+        g.db.execute("PRAGMA busy_timeout=30000")
     return g.db
 
 
@@ -195,6 +211,23 @@ def init_db():
             db.execute("ALTER TABLE entries ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")
         if "pdf_data" not in cols:
             db.execute("ALTER TABLE entries ADD COLUMN pdf_data BLOB DEFAULT NULL")
+        if "reembedded" not in cols:
+            db.execute("ALTER TABLE entries ADD COLUMN reembedded INTEGER NOT NULL DEFAULT 0")
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS entry_embedding_status (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry_id    INTEGER NOT NULL,
+                provider    TEXT    NOT NULL,
+                model       TEXT    NOT NULL,
+                dimension   INTEGER NOT NULL,
+                status      TEXT    NOT NULL DEFAULT 'ready',
+                updated_at  TEXT    DEFAULT (datetime('now')),
+                UNIQUE(entry_id, provider, model),
+                FOREIGN KEY(entry_id) REFERENCES entries(id) ON DELETE CASCADE
+            )
+        """)
+
         # RSS feeds table
         db.execute("""
             CREATE TABLE IF NOT EXISTS rss_feeds (
@@ -249,23 +282,130 @@ def init_db():
                 FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
             )
         """)
-        # Migration: wipe old embeddings if dimensions don't match new model (768 → 3072)
-        sample = db.execute("SELECT embedding FROM entries WHERE embedding != '' LIMIT 1").fetchone()
-        if sample:
-            try:
-                old_emb = json.loads(sample["embedding"])
-                if len(old_emb) != 3072:
-                    logger.info("Embedding dimensions changed (%d → 3072), wiping old embeddings…", len(old_emb))
-                    db.execute("UPDATE entries SET embedding = ''")
-                    db.execute("DELETE FROM entry_chunks")
-            except Exception:
-                pass
         db.commit()
 
 
 # ---------------------------------------------------------------------------
-# Gemini setup
+# LLM provider setup
 # ---------------------------------------------------------------------------
+_LLM_PROVIDER     = os.environ.get("LLM_PROVIDER", "gemini").strip().lower()
+_OLLAMA_URL        = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
+_OLLAMA_MODEL      = os.environ.get("OLLAMA_MODEL", "qwen3:14b")
+_OLLAMA_EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "qwen3-embedding:8b")
+
+_OLLAMA_CHAT_OPTIONS = {
+    "temperature": 0.1,
+    "num_predict": 2048,
+    "top_k": 50,
+    "top_p": 0.95,
+}
+_OLLAMA_ANALYZE_OPTIONS = {
+    "temperature": 0.3,
+    "num_predict": 5000,
+    "top_k": 10,
+    "top_p": 0.05,
+}
+
+_SYSTEM_PROMPT_BASE = os.environ.get("SYSTEM_PROMPT_BASE", """You are a concise cyber-security and AI tooling analyst.
+Given the raw text of a resource, respond with ONLY a valid JSON object
+(no markdown fences, no extra keys) in this exact shape:
+
+{{
+  "bullets":  ["<bullet 1>", "<bullet 2>", "<bullet 3>"],
+  "category": "<exactly one of: {categories}>",
+  "tags":     ["<tag1>", "<tag2>", "..."]
+}}
+
+Rules for bullets:
+- Exactly 3 bullets, each under 15 words. Plain text only.
+- Cover: what it is (general explanation to someone who dont know what we talk about), what it does, why it matters (one each).
+
+Rules for tags:
+- 5 to 15 tags. Lowercase, hyphenated (e.g. "use-after-free", "linux-kernel").
+- Only tag what is actually discussed — do not guess or hallucinate tags.
+- For CVEs always include the CVE ID as a tag (e.g. "cve-2024-1234").
+- Cover as many of the following categories as the content supports:
+
+  1. TOPIC / DOMAIN
+     recon, osint, web, appsec, cloud, network, mobile, iot, active-directory,
+     malware, reverse-engineering, ai-security, llm, mcp, automation,
+     bug-bounty, red-team, blue-team, threat-intel, exploit-dev, pwn
+
+  2. VULNERABILITY CLASS
+     sqli, xss, rce, ssrf, lfi, xxe, idor, csrf, ssti, command-injection,
+     deserialization, memory-corruption, buffer-overflow, heap-overflow,
+     stack-overflow, type-confusion, race-condition, integer-overflow,
+     logic-bug, format-string, path-traversal, open-redirect
+
+  3. MEMORY PRIMITIVES (if exploit or vuln research)
+     use-after-free, double-free, oob-read, oob-write, heap-spray, info-leak,
+     arbitrary-read, arbitrary-write, null-deref, stack-pivot, ret2libc,
+     rop, jop, tcache-poison, heap-fengshui, fake-chunk, fastbin-dup
+
+  4. INTERNAL STRUCTURES / FUNCTIONS (exact names, lowercased + hyphenated)
+     Tag notable kernel objects, syscalls, heap internals, Windows/Linux internals
+     that are central to the technique. Examples:
+     vtable, vptr, free-list, kmalloc, kfree, mmap, brk, slab, tcache,
+     pipe-inode, inode-cache, socket-buffer, msg-queue, tls-storage,
+     peb, teb, ldr-data, token-object, pool-chunk, alpc, lpc-port,
+     nt-allocate-virtual-memory, nt-create-section, virtual-alloc,
+     io-completion-port, object-manager, handle-table
+
+  5. DEFENSE MECHANISMS (tag what is bypassed, exploited, or discussed)
+     aslr, kaslr, dep, nx, stack-canary, pie, cfi, shadow-stack, safe-stack,
+     waf, edr, av, sandbox, seccomp, apparmor, selinux, hvci, kpp, kvas,
+     smep, smap, umip, pac, mte, exploit-mitigation, cfg, xfg
+
+Category definitions — apply in STRICT priority order (first match wins):
+
+1. cve      : a specific vulnerability advisory, CVE ID, or bug report. ALWAYS wins.
+
+2. list     : a curated collection of links/resources. STRONG signals:
+              - repo name starts with "awesome-" or contains "awesome"
+              - README is mostly bullet points linking to OTHER projects/tools/resources
+              - described as "curated list", "collection of", "resources for", "link roundup"
+              - Examples: awesome-hacking, awesome-mcp-servers, awesome-ai-security,
+                          top-bug-bounty-programs, security-resources
+
+3. mcp      : a Model Context Protocol (MCP) server or MCP client implementation.
+              - Primary purpose is providing MCP tools/resources to an AI host
+              - Repo name or README explicitly mentions "MCP server", "MCP client",
+                "Model Context Protocol"
+              - Examples: mcp-server-github, filesystem-mcp, any "mcp-server-*" repo
+              - NOT a general AI agent framework — must specifically implement MCP
+
+4. tool     : you INSTALL and RUN it — scanner, exploit, framework, PoC, CLI utility,
+              library that does security/hacking work FOR you.
+              - Has install instructions (pip, npm, go install, apt, etc.)
+              - Has usage/CLI examples
+              - Examples: nmap, nuclei, burpsuite, sqlmap, metasploit, semgrep, amass
+              - A tool that happens to USE AI is still a "tool", not "agent"
+
+5. agent    : Claude Code extensions/slash commands, LLM/AI agent frameworks (non-MCP),
+              prompt engineering guides, AI coding assistant resources, SPARC/memory agents.
+              - Must be PRIMARILY about building or using AI agents / LLMs
+              - Not just "uses AI" as a feature — the AI IS the product
+              - Examples: claude-code-guide, SPARC methodology, prompt-injection research,
+                          ai-agent-framework, llm-jailbreak-guide
+
+6. workflow : a repeatable process, methodology, checklist, or step-by-step procedure.
+              - Describes HOW to do something phase-by-phase
+              - Examples: bug-bounty-methodology, pentest-checklist, red-team-playbook
+
+7. article  : a blog post, paper, news writeup, or written analysis — typically NOT a repo.
+
+{custom_section}Do not include any text outside the JSON object.
+""")
+
+_CHAT_SYSTEM_PROMPT = os.environ.get("CHAT_SYSTEM_PROMPT", (
+    "You are a cyber-security expert assistant. "
+    "Answer ONLY using the knowledge base context provided below. "
+    "Cite the entry names you used. "
+    "If the answer is not in the context, say so explicitly.\n\n"
+    "KNOWLEDGE BASE CONTEXT:\n{context}"
+))
+
+# Gemini (only active when provider is "gemini")
 _API_KEY    = os.environ.get("GEMINI_API_KEY", "")
 _MODEL_NAME = "gemini-2.5-flash"
 _genai_client = genai.Client(api_key=_API_KEY) if _API_KEY else None
@@ -275,23 +415,17 @@ Given the raw text of a resource, respond with ONLY a valid JSON object
 (no markdown fences, no extra keys) in this exact shape:
 
 {{
-  "name":     "<short display name>",
   "bullets":  ["<bullet 1>", "<bullet 2>", "<bullet 3>"],
   "category": "<exactly one of: {categories}>",
   "tags":     ["<tag1>", "<tag2>", "..."]
 }}
 
-Rules for name:
-- The canonical name: tool name, repo name, article title, or CVE ID.
-- Max 6 words. No URLs.
-- Examples: "Nuclei", "claude-mem", "CVE-2024-1234", "Awesome AI Security"
-
 Rules for bullets:
 - Exactly 3 bullets, each under 15 words. Plain text only.
-- Cover: what it is, what it does, why it matters (one each).
+- Cover: what it is (general explanation to someone who dont know what we talk about), what it does, why it matters (one each).
 
 Rules for tags:
-- 3 to 15 tags. Lowercase, hyphenated (e.g. "use-after-free", "linux-kernel").
+- 5 to 15 tags. Lowercase, hyphenated (e.g. "use-after-free", "linux-kernel").
 - Only tag what is actually discussed — do not guess or hallucinate tags.
 - For CVEs always include the CVE ID as a tag (e.g. "cve-2024-1234").
 - Cover as many of the following categories as the content supports:
@@ -412,7 +546,7 @@ def _chunk_text(text: str) -> list[str]:
     return chunks
 
 
-def _get_embedding(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> list:
+def _get_embedding_gemini(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> list:
     result = _genai_client.models.embed_content(
         model=_EMBED_MODEL,
         contents=text,
@@ -421,32 +555,193 @@ def _get_embedding(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> list:
     return list(result.embeddings[0].values)
 
 
+# Ollama client (created lazily on first use to avoid startup errors when using Gemini)
+_ollama_client: _ollama_mod.Client | None = None
+
+
+def _get_ollama_client() -> _ollama_mod.Client:
+    global _ollama_client
+    if _ollama_client is None:
+        _ollama_client = _ollama_mod.Client(host=_OLLAMA_URL)
+    return _ollama_client
+
+
+def _ollama_list_models() -> list[dict]:
+    """Return installed Ollama models via ollama module list()."""
+    client = _get_ollama_client()
+    data = client.list()
+    models = []
+
+    # `ollama.Client.list()` may return a ListResponse object that behaves like ("models", [Model(...), ...]).
+    if hasattr(data, "models"):
+        entries = data.models or []
+    elif isinstance(data, (list, tuple)) and len(data) == 2 and data[0] == "models":
+        entries = data[1] or []
+    else:
+        # Fallback for other iterable shapes.
+        try:
+            entries = list(data)
+        except Exception:
+            entries = []
+
+    for m in entries:
+        if isinstance(m, dict):
+            name = m.get("name") or m.get("model")
+            size = m.get("size", None)
+            status = m.get("status", "installed")
+        else:
+            name = getattr(m, "name", None) or getattr(m, "model", None)
+            size = getattr(m, "size", None)
+            status = getattr(m, "status", "installed")
+
+        # Ollama list() shows installed models; mark accordingly when status absent.
+        status = status or "installed"
+
+        models.append({"name": name, "size": size, "status": status})
+
+    return models
+
+
+def _ollama_model_status(model_name: str) -> dict:
+    """Check if a model is currently loaded in Ollama.
+    Returns {"loaded": bool, "size_gb": float|None, "detail": str}."""
+    try:
+        models = _ollama_list_models()
+        base = model_name.split(":")[0]
+        for m in models:
+            if m.get("name", "").startswith(base):
+                size = m.get("size")
+                if isinstance(size, str) and size.lower().endswith("gb"):
+                    try:
+                        size_gb = float(size[:-2])
+                    except Exception:
+                        size_gb = None
+                elif isinstance(size, (int, float)):
+                    size_gb = float(size) / (1024 ** 3)
+                else:
+                    size_gb = None
+                return {"loaded": True, "size_gb": round(size_gb, 1) if size_gb is not None else None,
+                        "detail": m.get("name", model_name)}
+        return {"loaded": False, "size_gb": None, "detail": model_name}
+    except Exception:
+        return {"loaded": False, "size_gb": None, "detail": model_name}
+
+
+def _ollama_pre_flight_logs() -> list[str]:
+    """Return diagnostic log messages about Ollama readiness (call before the blocking LLM request)."""
+    if _LLM_PROVIDER != "ollama":
+        return []
+    logs = []
+    status = _ollama_model_status(_OLLAMA_MODEL)
+    if status["loaded"]:
+        logs.append(f"Ollama model {status['detail']} is loaded ({status['size_gb']} GB)")
+    else:
+        logs.append(
+            f"Ollama model {_OLLAMA_MODEL} is not loaded \u2014 it will be loaded on first request (this may take a while)"
+        )
+    logs.append(f"Analyzing with Ollama ({_OLLAMA_MODEL}) \u2014 duration depends on your local hardware")
+    return logs
+
+
+def _get_embedding_ollama(text: str, logs: list | None = None) -> list:
+    if logs is not None:
+        logs.append(f"Requesting embedding from Ollama ({_OLLAMA_EMBED_MODEL})...")
+    ollama_logger.debug(
+        "EMBED REQUEST — model=%s, input=%d chars: %s",
+        _OLLAMA_EMBED_MODEL, len(text), text[:200],
+    )
+    t0 = time.time()
+    try:
+        client = _get_ollama_client()
+        data = client.embed(model=_OLLAMA_EMBED_MODEL, input=text)
+    except _ollama_mod.ResponseError as e:
+        ollama_logger.error("EMBED ERROR: %s", e)
+        raise RuntimeError(f"Ollama embedding error: {e}") from e
+    except Exception as e:
+        if "connect" in str(e).lower() or "refused" in str(e).lower():
+            ollama_logger.error("EMBED CONNECTION ERROR: %s", e)
+            raise EnvironmentError(
+                f"Cannot connect to Ollama at {_OLLAMA_URL}. "
+                f"Make sure Ollama is running (ollama serve) and the required models are pulled:\n"
+                f"  ollama pull {_OLLAMA_EMBED_MODEL}"
+            ) from e
+        raise
+    elapsed = time.time() - t0
+    emb = list(data.embeddings[0])
+    ollama_logger.debug(
+        "EMBED RESPONSE — %d dims in %.1fs",
+        len(emb), elapsed,
+    )
+    if logs is not None:
+        logs.append(f"Embedding received in {elapsed:.1f}s ({len(emb)} dims)")
+    return emb
+
+
+def _current_embedding_target():
+    provider = _LLM_PROVIDER
+    model = _OLLAMA_EMBED_MODEL if provider == "ollama" else _EMBED_MODEL
+    return provider, model
+
+
+def _get_embedding(text: str, task_type: str = "RETRIEVAL_DOCUMENT") -> list:
+    if _LLM_PROVIDER == "ollama":
+        return _get_embedding_ollama(text)
+    return _get_embedding_gemini(text, task_type)
+
+
+def _upsert_entry_embedding_status(db, entry_id: int, dim: int, status: str = "ready"):
+    provider, model = _current_embedding_target()
+    db.execute(
+        "INSERT INTO entry_embedding_status (entry_id, provider, model, dimension, status, updated_at) "
+        "VALUES (?,?,?,?,?,datetime('now')) "
+        "ON CONFLICT(entry_id, provider, model) DO UPDATE SET dimension=excluded.dimension, status=excluded.status, updated_at=excluded.updated_at",
+        (entry_id, provider, model, dim, status),
+    )
+
+
+def _sqlite_retry(fn, retries: int = 8, delay: float = 0.15):
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return fn()
+        except sqlite3.OperationalError as exc:
+            if "database is locked" in str(exc).lower():
+                last_exc = exc
+                time.sleep(delay * (1 + attempt * 0.5))
+                continue
+            raise
+    raise last_exc
+
+
 def _store_entry_embedding(db, entry_id: int, name: str, bullets: list, tags: list,
                            content: str = "") -> None:
     """Chunk the entry content, embed each chunk, and store in entry_chunks."""
     header = f"{name}. {' '.join(bullets or [])}. {' '.join(tags or [])}."
-    db.execute("DELETE FROM entry_chunks WHERE entry_id = ?", (entry_id,))
 
-    text_chunks = _chunk_text(content.strip()) if content and content.strip() else []
+    def work():
+        _sqlite_retry(lambda: db.execute("DELETE FROM entry_chunks WHERE entry_id = ?", (entry_id,)))
 
-    if text_chunks:
-        for i, chunk in enumerate(text_chunks):
-            # Prepend header so every chunk has contextual identity
-            full_text = f"{header}\n{chunk}"[:8000]
-            emb = _get_embedding(full_text)
-            db.execute(
+        text_chunks = _chunk_text(content.strip()) if content and content.strip() else []
+
+        if text_chunks:
+            for i, chunk in enumerate(text_chunks):
+                full_text = f"{header}\n{chunk}"[:8000]
+                emb = _get_embedding(full_text)
+                _sqlite_retry(lambda: db.execute(
+                    "INSERT INTO entry_chunks (entry_id, chunk_index, chunk_text, embedding) VALUES (?,?,?,?)",
+                    (entry_id, i, chunk[:3000], json.dumps(emb)),
+                ))
+        else:
+            emb = _get_embedding(header)
+            _sqlite_retry(lambda: db.execute(
                 "INSERT INTO entry_chunks (entry_id, chunk_index, chunk_text, embedding) VALUES (?,?,?,?)",
-                (entry_id, i, chunk[:3000], json.dumps(emb)),
-            )
-    else:
-        emb = _get_embedding(header)
-        db.execute(
-            "INSERT INTO entry_chunks (entry_id, chunk_index, chunk_text, embedding) VALUES (?,?,?,?)",
-            (entry_id, 0, header, json.dumps(emb)),
-        )
+                (entry_id, 0, header, json.dumps(emb)),
+            ))
 
-    db.execute("UPDATE entries SET embedding = '' WHERE id = ?", (entry_id,))
-    db.commit()
+        _upsert_entry_embedding_status(db, entry_id, len(emb), "ready")
+        _sqlite_retry(lambda: db.commit())
+
+    work()
 
 
 def _cosine_sim(a: list, b: list) -> float:
@@ -535,7 +830,7 @@ def _extract_video_id(url: str) -> str | None:
     return m.group("v1") or m.group("v2") or m.group("v3")
 
 
-def _fetch_youtube_content(url: str) -> tuple[str, list[str]]:
+def _fetch_youtube_content(url: str) -> tuple[str, list[str], str]:
     logs = []
     video_id = _extract_video_id(url)
     if not video_id:
@@ -604,7 +899,7 @@ def _fetch_youtube_content(url: str) -> tuple[str, list[str]]:
 
     content = f"# {title}\n\nYouTube URL: {url}\n\n## Transcript\n\n{transcript_text}"
     logs.append(f"Total content size: {len(content):,} chars")
-    return content, logs
+    return content, logs, title
 
 
 _YT_PLAYLIST_RE = re.compile(
@@ -639,37 +934,14 @@ def _fetch_article_content(url: str, return_title: bool = False):
 
 
 # ---------------------------------------------------------------------------
-# Gemini call
+# Shared LLM JSON response parser
 # ---------------------------------------------------------------------------
-def _call_gemini(content: str, custom_cats: list = []) -> tuple[dict, list[str]]:
-    logs = []
-    if not _API_KEY:
-        raise EnvironmentError("GEMINI_API_KEY not set in .env")
+def _parse_llm_json(raw: str, custom_cats: list, logs: list) -> dict:
+    """Extract and validate the structured JSON from an LLM response string."""
+    # Strip <think>…</think> blocks (qwen3 reasoning traces)
+    raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
 
-    logs.append(f"Sending {len(content):,} chars to {_MODEL_NAME}...")
-    t0 = time.time()
-
-    # Strip ASCII control characters (except tab/newline) that can corrupt Gemini's JSON output
-    content = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", content)
-    # Hard cap at 120k chars to stay well within the model's practical JSON output limit
-    if len(content) > 120_000:
-        content = content[:120_000] + "\n\n[content truncated]"
-
-    response = _genai_client.models.generate_content(
-        model=_MODEL_NAME,
-        contents=content,
-        config=genai_types.GenerateContentConfig(
-            system_instruction=_build_system_prompt(custom_cats),
-            temperature=0.1,
-            max_output_tokens=1024,
-            response_mime_type="application/json",
-            thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
-        ),
-    )
-
-    elapsed = time.time() - t0
-    raw = response.text.strip()
-    logs.append(f"Gemini responded in {elapsed:.1f}s")
+    logs.append(f"Raw LLM response ({len(raw):,} chars): {raw[:200]}{'…' if len(raw) > 200 else ''}")
 
     if raw.startswith("```"):
         raw = re.sub(r"^```[a-z]*\n?", "", raw)
@@ -694,17 +966,30 @@ def _call_gemini(content: str, custom_cats: list = []) -> tuple[dict, list[str]]
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
-        # Gemini occasionally emits slightly malformed JSON (bad escapes, trailing commas).
-        # json_repair fixes the most common cases without silently swallowing real errors.
         try:
             parsed = json_repair.loads(raw)
         except Exception as repair_exc:
-            raise RuntimeError(f"Gemini returned unparseable JSON: {repair_exc} — raw: {raw[:300]}")
+            raise RuntimeError(f"LLM returned unparseable JSON: {repair_exc} — raw: {raw[:300]}")
+
     valid    = {"tool", "agent", "mcp", "list", "workflow", "cve", "article", "video", "playlist"} | {c["slug"] for c in custom_cats}
-    name     = str(parsed.get("name", "")).strip()
-    bullets  = [str(b).strip() for b in parsed.get("bullets", []) if str(b).strip()][:3]
+    name     = str(parsed.get("name", parsed.get("title", ""))).strip()
+
+    # Accept alternate field names for bullets
+    bullets_raw = parsed.get("bullets") or parsed.get("key_points") or parsed.get("summary") or parsed.get("highlights") or []
+    if isinstance(bullets_raw, str):
+        bullets_raw = [bullets_raw]
+    bullets = [str(b).strip() for b in bullets_raw if str(b).strip()][:3]
+
+    # Last resort: synthesize bullets from description field
+    if not bullets:
+        desc = str(parsed.get("description", parsed.get("overview", ""))).strip()
+        if desc:
+            bullets = [desc[:100]]
+            logs.append("No 'bullets' field — synthesized from description")
+
     category = str(parsed.get("category", "")).strip().lower()
-    # Accept legacy "skill" from existing entries
+    # Normalize freeform categories into valid ones
+    category = re.sub(r"[^a-z0-9\-]", "-", category).strip("-")
     if category == "skill":
         category = "agent"
     tags     = [
@@ -715,13 +1000,170 @@ def _call_gemini(content: str, custom_cats: list = []) -> tuple[dict, list[str]]
     tags = [t for t in tags if t][:20]
 
     if not bullets:
-        raise RuntimeError("Gemini returned no bullets")
+        preview = json.dumps(parsed, ensure_ascii=False)[:300]
+        raise RuntimeError(f"LLM returned no bullets — parsed JSON: {preview}")
     if category not in valid:
         logs.append(f"Unknown category '{category}' — defaulting to 'article'")
         category = "article"
 
     logs.append(f"Classified as: {category} — \"{name}\" — tags: {', '.join(tags)}")
-    return {"name": name, "bullets": bullets, "category": category, "tags": tags}, logs
+    return {"name": name, "bullets": bullets, "category": category, "tags": tags}
+
+
+def _sanitize_content(content: str, max_chars: int = 120_000) -> str:
+    """Strip control chars and cap length for LLM input."""
+    content = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", content)
+    # Local models need less context to stay reliable
+    effective_max = 30_000 if _LLM_PROVIDER == "ollama" else max_chars
+    if len(content) > effective_max:
+        content = content[:effective_max] + "\n\n[content truncated]"
+    return content
+
+
+# ---------------------------------------------------------------------------
+# Gemini call (implementation)
+# ---------------------------------------------------------------------------
+def _call_gemini_impl(content: str, custom_cats: list = []) -> tuple[dict, list[str]]:
+    logs = []
+    if not _API_KEY:
+        raise EnvironmentError("GEMINI_API_KEY not set in .env")
+
+    logs.append(f"Sending {len(content):,} chars to {_MODEL_NAME}...")
+    t0 = time.time()
+
+    content = _sanitize_content(content)
+
+    response = _genai_client.models.generate_content(
+        model=_MODEL_NAME,
+        contents=content,
+        config=genai_types.GenerateContentConfig(
+            system_instruction=_build_system_prompt(custom_cats),
+            temperature=0.1,
+            max_output_tokens=1024,
+            response_mime_type="application/json",
+            thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
+        ),
+    )
+
+    elapsed = time.time() - t0
+    raw = response.text.strip()
+    logs.append(f"Gemini responded in {elapsed:.1f}s")
+
+    result = _parse_llm_json(raw, custom_cats, logs)
+    return result, logs
+
+
+# ---------------------------------------------------------------------------
+# JSON schema for structured Ollama output (used with format= parameter)
+# ---------------------------------------------------------------------------
+_OLLAMA_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "bullets":  {"type": "array", "items": {"type": "string"}},
+        "category": {"type": "string"},
+        "tags":     {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["bullets", "category", "tags"],
+}
+
+
+def _extract_ollama_stats(resp) -> str:
+    """Build a human-readable stats line from an Ollama ChatResponse."""
+    prompt_eval_s = (resp.prompt_eval_duration or 0) / 1e9
+    eval_s        = (resp.eval_duration or 0) / 1e9
+    load_s        = (resp.load_duration or 0) / 1e9
+    total_s       = (resp.total_duration or 0) / 1e9
+    eval_count    = resp.eval_count or 0
+    prompt_count  = resp.prompt_eval_count or 0
+    tok_per_s     = eval_count / eval_s if eval_s > 0 else 0
+    return (
+        f"Ollama stats — total: {total_s:.1f}s, "
+        f"load: {load_s:.1f}s, "
+        f"prompt eval: {prompt_eval_s:.1f}s ({prompt_count} tokens), "
+        f"generation: {eval_s:.1f}s ({eval_count} tokens, {tok_per_s:.1f} tok/s)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ollama call (implementation) — uses ollama module with streaming + format
+# ---------------------------------------------------------------------------
+def _call_ollama(content: str, custom_cats: list = [], purpose: str = "analyze") -> tuple[dict, list[str]]:
+    logs = []
+    t0 = time.time()
+
+    content = _sanitize_content(content)
+    if purpose == "chat":
+        system_prompt = _CHAT_SYSTEM_PROMPT
+        options = _OLLAMA_CHAT_OPTIONS
+    else:
+        # For analysis, we build the default structured prompt with category extension.
+        system_prompt = _build_system_prompt(custom_cats)
+        options = _OLLAMA_ANALYZE_OPTIONS
+
+    ollama_logger.debug(
+        "REQUEST — model=%s, purpose=%s, system_prompt=%d chars, content=%d chars",
+        _OLLAMA_MODEL, purpose, len(system_prompt), len(content),
+    )
+    logs.append(f"Sending {len(content):,} chars to Ollama ({_OLLAMA_MODEL})..." )
+
+    try:
+        client = _get_ollama_client()
+        stream = client.chat(
+            model=_OLLAMA_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": content},
+            ],
+            stream=True,
+            think=True,
+            format=_OLLAMA_JSON_SCHEMA,
+            options=options,
+        )
+    except _ollama_mod.ResponseError as e:
+        raise RuntimeError(f"Ollama error: {e}") from e
+    except Exception as e:
+        if "connect" in str(e).lower() or "refused" in str(e).lower():
+            raise EnvironmentError(
+                f"Cannot connect to Ollama at {_OLLAMA_URL}. "
+                f"Make sure Ollama is running (ollama serve) and the model is pulled:\n"
+                f"  ollama pull {_OLLAMA_MODEL}"
+            ) from e
+        raise
+
+    # ── Stream response, accumulate tokens ────────────────────────────
+    chunks = []
+    last_resp = None
+    for chunk in stream:
+        token = chunk.message.content or ""
+        if token:
+            chunks.append(token)
+        last_resp = chunk
+
+    raw = "".join(chunks).strip()
+    elapsed = time.time() - t0
+
+    # ── Ollama performance stats (available on the final streamed chunk) ──
+    stats_line = _extract_ollama_stats(last_resp) if last_resp else f"Ollama responded in {elapsed:.1f}s"
+    logs.append(f"Ollama responded in {elapsed:.1f}s ({len(raw):,} chars)")
+    logs.append(stats_line)
+
+    # ── Full debug logging ────────────────────────────────────────────
+    ollama_logger.info(stats_line)
+    ollama_logger.debug("RESPONSE (%d chars): %s", len(raw), raw[:2000])
+    if len(raw) > 2000:
+        ollama_logger.debug("RESPONSE (continued): %s", raw[2000:])
+
+    result = _parse_llm_json(raw, custom_cats, logs)
+    return result, logs
+
+
+# ---------------------------------------------------------------------------
+# LLM dispatcher (keeps the _call_gemini name so all call sites stay unchanged)
+# ---------------------------------------------------------------------------
+def _call_gemini(content: str, custom_cats: list = []) -> tuple[dict, list[str]]:
+    if _LLM_PROVIDER == "ollama":
+        return _call_ollama(content, custom_cats)
+    return _call_gemini_impl(content, custom_cats)
 
 
 # ---------------------------------------------------------------------------
@@ -789,7 +1231,11 @@ def _process_playlist(url: str):
                     pass
                 for msg in fetch_logs:
                     yield log(f"  {msg}")
+                for msg in _ollama_pre_flight_logs():
+                    yield log(f"  {msg}")
                 result, gemini_logs = _call_gemini(content, custom_cats)
+                # Deterministic video name from metadata (fallback to LLM if unavailable)
+                result["name"] = vid_name or result.get("name", f"Video {i+1}")
                 result["category"] = "video"
                 for msg in gemini_logs:
                     yield log(f"  {msg}")
@@ -844,7 +1290,7 @@ def _process_playlist(url: str):
         try:
             pl_result, gemini_logs = _call_gemini(summary_text, custom_cats)
             pl_result["category"] = "playlist"
-            pl_result["name"]     = pl_result.get("name") or pl_title
+            pl_result["name"]     = pl_title or url
             for msg in gemini_logs:
                 yield log(msg)
         except Exception as exc:
@@ -1048,6 +1494,8 @@ def _process_blog_listing(url: str, selected_urls: list | None = None, listing_t
                 content, fetch_logs, page_title = _fetch_article_content(art_url, return_title=True)
                 for msg in fetch_logs:
                     yield log(f"  {msg}")
+                for msg in _ollama_pre_flight_logs():
+                    yield log(f"  {msg}")
                 result, gemini_logs = _call_gemini(content, custom_cats)
                 result["category"] = "article"
                 # Use the real page title instead of Gemini's generated name
@@ -1206,19 +1654,34 @@ def _process_url(url: str, source: str = "manual"):
         custom_cats = [dict(r) for r in db.execute("SELECT slug, label FROM custom_categories ORDER BY id").fetchall()]
         row = db.execute("SELECT * FROM entries WHERE url = ?", (url,)).fetchone()
         if row:
-            yield log("Cache hit — returning saved entry")
-            yield {"type": "result", "entry": _row_to_dict(row, db)}
-            return
+            # If the cached entry lacks a name or bullets it was likely left
+            # by a failed or incomplete analysis — remove it and re-analyze.
+            bullets_raw = row["bullets"] or "[]"
+            if not row["name"] or bullets_raw in ("", "[]"):
+                db.execute("DELETE FROM entries WHERE id = ?", (row["id"],))
+                db.commit()
+                yield log("Removed incomplete cached entry — re-analyzing")
+            else:
+                yield log("Cache hit — returning saved entry")
+                yield {"type": "result", "entry": _row_to_dict(row, db)}
+                return
 
         yield log("Starting analysis")
 
+        deterministic_name = None
+        deterministic_category = None
         try:
             if _extract_video_id(url):
-                content, fetch_logs = _fetch_youtube_content(url)
+                content, fetch_logs, page_title = _fetch_youtube_content(url)
+                deterministic_name = page_title or url
+                deterministic_category = "video"
             elif _GH_REPO_RE.match(url):
                 content, fetch_logs = _fetch_github_content(url)
+                gh_match = _GH_REPO_RE.match(url)
+                deterministic_name = f"{gh_match.group('repo')}" if gh_match else url
             else:
-                content, fetch_logs = _fetch_article_content(url)
+                content, fetch_logs, page_title = _fetch_article_content(url, return_title=True)
+                deterministic_name = page_title or url
             for msg in fetch_logs:
                 yield log(msg)
         except Exception as exc:
@@ -1227,17 +1690,25 @@ def _process_url(url: str, source: str = "manual"):
             yield {"type": "error", "msg": msg}
             return
 
+        for msg in _ollama_pre_flight_logs():
+            yield log(msg)
+
         try:
             result, gemini_logs = _call_gemini(content, custom_cats)
             for msg in gemini_logs:
                 yield log(msg)
-            if _extract_video_id(url):
-                result["category"] = "video"
+
+            # Deterministic name/category override (source-based)
+            if deterministic_name:
+                result["name"] = deterministic_name
+            if deterministic_category:
+                result["category"] = deterministic_category
         except EnvironmentError as exc:
+            logger.error("[%s] %s", url, exc)
             yield {"type": "error", "msg": str(exc)}
             return
         except Exception as exc:
-            msg = f"Gemini failed: {exc}"
+            msg = f"LLM failed: {exc}"
             logger.error("[%s] %s", url, msg)
             yield {"type": "error", "msg": msg}
             return
@@ -1388,21 +1859,29 @@ def _process_pdf(file_bytes: bytes, filename: str):
 
         yield log(f"Extracted {len(content):,} characters")
 
+        for msg in _ollama_pre_flight_logs():
+            yield log(msg)
+
         try:
             result, gemini_logs = _call_gemini(content, custom_cats)
             for msg in gemini_logs:
                 yield log(msg)
         except EnvironmentError as exc:
+            logger.error("PDF analysis env error: %s", exc)
             yield {"type": "error", "msg": str(exc)}
             return
         except Exception as exc:
-            yield {"type": "error", "msg": f"Gemini failed: {exc}"}
+            yield {"type": "error", "msg": f"LLM failed: {exc}"}
             return
+
+        deterministic_name = os.path.splitext(os.path.basename(filename))[0] if filename else "PDF"
+        entry_name = deterministic_name or result.get("name", "PDF")
+        entry_category = "pdf"
 
         cur = db.execute(
             "INSERT INTO entries (url, name, bullets, category, tags, content, source, pdf_data) VALUES (?,?,?,?,?,?,?,?)",
-            (synthetic_url, result["name"], json.dumps(result["bullets"]),
-             result["category"], json.dumps(result["tags"]), content, "pdf", file_bytes),
+            (synthetic_url, entry_name, json.dumps(result["bullets"]),
+             entry_category, json.dumps(result["tags"]), content, "pdf", file_bytes),
         )
         db.commit()
         yield log("Saved to knowledge base")
@@ -1410,7 +1889,7 @@ def _process_pdf(file_bytes: bytes, filename: str):
         try:
             _store_entry_embedding(
                 db, cur.lastrowid,
-                result["name"], result["bullets"], result["tags"], content,
+                entry_name, result["bullets"], result["tags"], content,
             )
             yield log("Embedding stored")
         except Exception as exc:
@@ -1829,7 +2308,7 @@ def semantic_search():
     q = request.args.get("q", "").strip()
     if not q:
         return jsonify([]), 200
-    if not _API_KEY:
+    if _LLM_PROVIDER == "gemini" and not _API_KEY:
         return jsonify({"error": "GEMINI_API_KEY not set"}), 500
     logger.info("Semantic search: %r", q)
     try:
@@ -1883,28 +2362,229 @@ def semantic_search():
     return jsonify(results), 200
 
 
+def _fetch_embedding_health():
+    """Check embedding status using the entry_embedding_status table.
+
+    Returns a dict with counts of embedded/missing entries for the current
+    provider+model.  No LLM API calls are made — everything comes from the DB.
+    """
+    db = get_db()
+    provider, model = _current_embedding_target()
+
+    total_entries = db.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+    if total_entries == 0:
+        return {
+            "ok": True,
+            "total": 0,
+            "embedded": 0,
+            "mismatched": 0,
+            "missing": 0,
+            "missing_ids": [],
+            "mismatch_ids": [],
+            "provider": provider,
+            "model": model,
+        }
+
+    # Entries that are ready for the *current* provider+model
+    ready_rows = db.execute(
+        "SELECT entry_id FROM entry_embedding_status "
+        "WHERE provider = ? AND model = ? AND status = 'ready'",
+        (provider, model),
+    ).fetchall()
+    ready_ids = set(r[0] for r in ready_rows)
+
+    # All entry IDs
+    all_ids = set(
+        r[0] for r in db.execute("SELECT id FROM entries").fetchall()
+    )
+
+    # Missing = entries without a ready embedding for the current model
+    missing_ids = sorted(all_ids - ready_ids)
+
+    embedded = len(ready_ids)
+    missing = len(missing_ids)
+    ok = missing == 0
+
+    return {
+        "ok": ok,
+        "total": total_entries,
+        "embedded": embedded,
+        "mismatched": 0,
+        "missing": missing,
+        "missing_ids": missing_ids,
+        "mismatch_ids": [],
+        "provider": provider,
+        "model": model,
+    }
+
+
+@app.route("/embeddings/status")
+def embeddings_status():
+    try:
+        data = _fetch_embedding_health()
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    return jsonify(data), 200
+
+
+def _embed_all_runner(all_mode=False):
+    global _embed_all_status
+    if _LLM_PROVIDER == "gemini" and not _API_KEY:
+        return jsonify({"error": "GEMINI_API_KEY not set"}), 500
+
+    db = get_db()
+
+    _embed_all_status = {
+        "active": True,
+        "done": 0,
+        "total": 0,
+        "failed": 0,
+        "message": "Starting re-embed",
+        "updated_at": time.time(),
+    }
+
+    # DB consistency check before starting long-running re-embed
+    try:
+        check = db.execute("PRAGMA integrity_check").fetchone()
+        if not check or check[0] != 'ok':
+            _embed_all_status.update({
+                "active": False,
+                "message": f"Database integrity check failed: {check}",
+                "updated_at": time.time(),
+            })
+            return jsonify({"error": "Database integrity check failed. Please restore from backup."}), 500
+    except sqlite3.OperationalError as exc:
+        if "database is locked" in str(exc).lower():
+            _embed_all_status.update({
+                "active": False,
+                "message": f"Database is locked: {exc}",
+                "updated_at": time.time(),
+            })
+            return jsonify({"error": "Database is locked. Please retry in a moment."}), 503
+        _embed_all_status.update({
+            "active": False,
+            "message": f"Database unreadable: {exc}",
+            "updated_at": time.time(),
+        })
+        return jsonify({"error": f"Database is malformed: {exc}. Try restoring from backup."}), 500
+    except sqlite3.DatabaseError as exc:
+        _embed_all_status.update({
+            "active": False,
+            "message": f"Database unreadable: {exc}",
+            "updated_at": time.time(),
+        })
+        return jsonify({"error": f"Database is malformed: {exc}. Try restoring from backup."}), 500
+
+    if all_mode:
+        # Full wipe: clear ALL chunks and status, then re-embed everything
+        db.execute("DELETE FROM entry_chunks")
+        db.execute("DELETE FROM entry_embedding_status")
+        db.commit()
+        logger.info("embed-all: wiped entry_chunks and entry_embedding_status for full rebuild")
+        rows = db.execute("SELECT * FROM entries").fetchall()
+    else:
+        # Targeted: only entries missing embeddings for the current model
+        health = _fetch_embedding_health()
+        missing_ids = health["missing_ids"]
+        if missing_ids:
+            placeholders = ",".join(["?"] * len(missing_ids))
+            sql = "SELECT * FROM entries WHERE id IN (" + placeholders + ")"  # nosec B608
+            rows = db.execute(sql, missing_ids).fetchall()
+        else:
+            rows = []
+
+    total = len(rows)
+    provider, model = _current_embedding_target()
+    if all_mode:
+        logger.info("embed-all: %d entries to embed (full re-embed for %s/%s)", total, provider, model)
+        _embed_all_status["message"] = f"Full re-embed for {provider}/{model}"
+    else:
+        logger.info("embed-all: %d entries need embedding for %s/%s", total, provider, model)
+        _embed_all_status["message"] = f"{total} entries to embed for {provider}/{model}"
+
+    rows_data = [dict(r) for r in rows]
+    _embed_all_status.update({"total": total, "updated_at": time.time()})
+
+    def generate():
+        sdb = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+        sdb.row_factory = sqlite3.Row
+        sdb.execute("PRAGMA journal_mode=WAL")
+        sdb.execute("PRAGMA busy_timeout=30000")
+        done, failed = 0, 0
+
+        try:
+            for row in rows_data:
+                model_name = row.get("name") or ""
+                try:
+                    bullets = json.loads(row.get("bullets") or "[]")
+                    tags = json.loads(row.get("tags") or "[]")
+                    content = row.get("content") or ""
+                    _store_entry_embedding(sdb, row["id"], model_name, bullets, tags, content)
+                    _sqlite_retry(lambda: sdb.commit())
+                    done += 1
+                except sqlite3.OperationalError as exc:
+                    if "database is locked" in str(exc).lower():
+                        logger.warning("embed-all row %d locked, retrying: %s", row.get("id"), exc)
+                        time.sleep(1)
+                        continue
+                    logger.error("embed-all row %d DB error: %s", row.get("id"), exc)
+                    _embed_all_status.update({
+                        "active": False,
+                        "message": f"Database error: {exc}",
+                        "updated_at": time.time(),
+                    })
+                    yield json.dumps({"type": "error", "message": f"Database error: {exc}"}) + "\n"
+                    return
+                except sqlite3.DatabaseError as exc:
+                    logger.error("embed-all row %d DB error: %s", row.get("id"), exc)
+                    _embed_all_status.update({
+                        "active": False,
+                        "message": f"Database error: {exc}",
+                        "updated_at": time.time(),
+                    })
+                    yield json.dumps({"type": "error", "message": f"Database error: {exc}"}) + "\n"
+                    return
+                except Exception as exc:
+                    logger.error("embed-all row %d: %s", row.get("id"), exc)
+                    failed += 1
+                _embed_all_status.update({
+                    "done": done,
+                    "failed": failed,
+                    "message": f"Re-embedding {done}/{total} (failed {failed})",
+                    "updated_at": time.time(),
+                })
+                yield json.dumps({"type": "progress", "done": done, "failed": failed, "total": total, "name": model_name}) + "\n"
+
+            logger.info("embed-all: done=%d failed=%d", done, failed)
+            _embed_all_status.update({
+                "active": False,
+                "done": done,
+                "failed": failed,
+                "message": "Re-embedding complete",
+                "updated_at": time.time(),
+            })
+            yield json.dumps({"type": "complete", "done": done, "failed": failed, "total": total}) + "\n"
+        finally:
+            sdb.close()
+
+    return Response(stream_with_context(generate()), mimetype="application/x-ndjson")
+
+
 @app.route("/entries/embed-all", methods=["POST"])
 def embed_all():
-    """Chunk and embed all entries that don't have chunks yet."""
-    if not _API_KEY:
-        return jsonify({"error": "GEMINI_API_KEY not set"}), 500
-    db   = get_db()
-    rows = db.execute(
-        "SELECT * FROM entries WHERE id NOT IN (SELECT DISTINCT entry_id FROM entry_chunks)"
-    ).fetchall()
-    done, failed = 0, 0
-    for row in rows:
-        try:
-            bullets = json.loads(row["bullets"] or "[]")
-            tags    = json.loads(row["tags"]    or "[]")
-            content = row["content"] or ""
-            _store_entry_embedding(db, row["id"], row["name"] or "", bullets, tags, content)
-            done += 1
-        except Exception as exc:
-            logger.error("embed-all row %d: %s", row["id"], exc)
-            failed += 1
-    logger.info("embed-all: done=%d failed=%d", done, failed)
-    return jsonify({"done": done, "failed": failed}), 200
+    all_mode = request.args.get("all", "false").lower() in ("1", "true", "yes")
+    return _embed_all_runner(all_mode)
+
+
+@app.route("/entries/embed-required", methods=["POST"])
+def embed_required():
+    return _embed_all_runner(False)
+
+
+@app.route("/entries/embed-all/status", methods=["GET"])
+def embed_all_status():
+    global _embed_all_status
+    return jsonify(_embed_all_status), 200
 
 
 # ---------------------------------------------------------------------------
@@ -2522,7 +3202,13 @@ def get_chat_messages(session_id):
     return jsonify(result), 200
 
 
-_VALID_CHAT_MODELS = {"gemini-2.5-flash", "gemini-2.5-pro", "gemini-1.5-flash", "gemini-1.5-pro"}
+_VALID_CHAT_MODELS_GEMINI = {"gemini-2.5-flash", "gemini-2.5-pro", "gemini-1.5-flash", "gemini-1.5-pro"}
+_VALID_CHAT_MODELS_OLLAMA = {_OLLAMA_MODEL}
+_VALID_CHAT_MODELS = _VALID_CHAT_MODELS_GEMINI | _VALID_CHAT_MODELS_OLLAMA
+
+
+def _default_chat_model() -> str:
+    return _OLLAMA_MODEL if _LLM_PROVIDER == "ollama" else _MODEL_NAME
 
 _CHAT_SYSTEM_PROMPT = (
     "You are a cyber-security expert assistant. "
@@ -2531,6 +3217,237 @@ _CHAT_SYSTEM_PROMPT = (
     "If the answer is not in the context, say so explicitly.\n\n"
     "KNOWLEDGE BASE CONTEXT:\n{context}"
 )
+
+
+def _read_env_file():
+    path = os.path.join(os.path.dirname(__file__), ".env")
+    if not os.path.exists(path):
+        return {}
+    data = {}
+
+    def decode_value(val: str):
+        val = val.strip()
+        if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+            try:
+                return json.loads(val)
+            except Exception:
+                val = val[1:-1]
+        try:
+            return bytes(val, "utf-8").decode("unicode_escape")
+        except Exception:
+            return val
+
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            data[key.strip()] = decode_value(val.strip())
+    return data
+
+
+def _write_env_file(updates: dict):
+    path = os.path.join(os.path.dirname(__file__), ".env")
+    lines = []
+    seen = set()
+
+    def encode_value(val):
+        if not isinstance(val, str):
+            val = str(val)
+        if "\n" in val or "\"" in val or "'" in val or val.strip() != val:
+            return json.dumps(val, ensure_ascii=False)
+        return val
+
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#") or "=" not in stripped:
+                    lines.append(line)
+                    continue
+                key, _ = stripped.split("=", 1)
+                key = key.strip()
+                if key in updates:
+                    lines.append(f"{key}={encode_value(updates[key])}\n")
+                    seen.add(key)
+                else:
+                    lines.append(line)
+    for key, value in updates.items():
+        if key not in seen:
+            lines.append(f"{key}={encode_value(value)}\n")
+    with open(path, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+
+
+def _reload_provider_settings():
+    global _LLM_PROVIDER, _API_KEY, _OLLAMA_URL, _OLLAMA_MODEL, _OLLAMA_EMBED_MODEL, _genai_client, _VALID_CHAT_MODELS_OLLAMA, _VALID_CHAT_MODELS
+    global _SYSTEM_PROMPT_BASE, _CHAT_SYSTEM_PROMPT, _OLLAMA_CHAT_OPTIONS, _OLLAMA_ANALYZE_OPTIONS
+
+    env = _read_env_file()
+    _LLM_PROVIDER = env.get("LLM_PROVIDER", _LLM_PROVIDER).strip().lower()
+    _API_KEY = env.get("GEMINI_API_KEY", _API_KEY).strip()
+    _OLLAMA_URL = env.get("OLLAMA_URL", _OLLAMA_URL).strip().rstrip("/")
+    _OLLAMA_MODEL = env.get("OLLAMA_MODEL", _OLLAMA_MODEL).strip()
+    _OLLAMA_EMBED_MODEL = env.get("OLLAMA_EMBED_MODEL", _OLLAMA_EMBED_MODEL).strip()
+
+    _SYSTEM_PROMPT_BASE = env.get("SYSTEM_PROMPT_BASE", _SYSTEM_PROMPT_BASE)
+    _CHAT_SYSTEM_PROMPT = env.get("CHAT_SYSTEM_PROMPT", _CHAT_SYSTEM_PROMPT)
+
+    def _parse_options(value, fallback):
+        if not value:
+            return fallback
+        try:
+            opts = json.loads(value)
+            if isinstance(opts, dict):
+                return opts
+        except Exception:
+            pass
+        return fallback
+
+    _OLLAMA_CHAT_OPTIONS = _parse_options(env.get("OLLAMA_CHAT_OPTIONS", json.dumps(_OLLAMA_CHAT_OPTIONS)), _OLLAMA_CHAT_OPTIONS)
+    _OLLAMA_ANALYZE_OPTIONS = _parse_options(env.get("OLLAMA_ANALYZE_OPTIONS", json.dumps(_OLLAMA_ANALYZE_OPTIONS)), _OLLAMA_ANALYZE_OPTIONS)
+
+    _genai_client = genai.Client(api_key=_API_KEY) if _API_KEY else None
+    _VALID_CHAT_MODELS_OLLAMA = {_OLLAMA_MODEL}
+    _VALID_CHAT_MODELS = _VALID_CHAT_MODELS_GEMINI | _VALID_CHAT_MODELS_OLLAMA
+
+
+@app.route("/settings", methods=["GET"])
+def get_settings():
+    env = _read_env_file()
+    return jsonify({
+        "provider": env.get("LLM_PROVIDER", _LLM_PROVIDER),
+        "gemini_api_key": env.get("GEMINI_API_KEY", ""),
+        "ollama_url": env.get("OLLAMA_URL", _OLLAMA_URL),
+        "ollama_model": env.get("OLLAMA_MODEL", _OLLAMA_MODEL),
+        "ollama_embed_model": env.get("OLLAMA_EMBED_MODEL", _OLLAMA_EMBED_MODEL),
+        "system_prompt_base": env.get("SYSTEM_PROMPT_BASE", _SYSTEM_PROMPT_BASE),
+        "chat_system_prompt": env.get("CHAT_SYSTEM_PROMPT", _CHAT_SYSTEM_PROMPT),
+        "ollama_chat_options": env.get("OLLAMA_CHAT_OPTIONS", json.dumps(_OLLAMA_CHAT_OPTIONS, indent=2)),
+        "ollama_analyze_options": env.get("OLLAMA_ANALYZE_OPTIONS", json.dumps(_OLLAMA_ANALYZE_OPTIONS, indent=2)),
+        "gemini_models": [
+            "gemini-2.5-flash", "gemini-2.5-pro", "gemini-1.5-flash", "gemini-1.5-pro",
+        ],
+        "ollama_models": [
+            "qwen3:4b", "qwen3:8b", "qwen3:14b", "qwen3:30b",
+        ],
+        "ollama_embedding_models": [
+            "qwen3-embedding:8b", "embeddinggemma:300m" , "nomic-embed-text:v1.5"
+        ],
+    })
+
+
+@app.route("/settings", methods=["POST"])
+def update_settings():
+    body = request.get_json(silent=True)
+    if not body or not isinstance(body, dict):
+        return jsonify({"error": "Invalid JSON body"}), 400
+
+    provider = str(body.get("provider", _LLM_PROVIDER)).strip().lower()
+    if provider not in ("gemini", "ollama"):
+        return jsonify({"error": "Invalid provider"}), 400
+
+    gemini_api_key = str(body.get("gemini_api_key", "")).strip()
+    ollama_url = str(body.get("ollama_url", _OLLAMA_URL)).strip() or _OLLAMA_URL
+    ollama_model = str(body.get("ollama_model", _OLLAMA_MODEL)).strip() or _OLLAMA_MODEL
+    ollama_embed_model = str(body.get("ollama_embed_model", _OLLAMA_EMBED_MODEL)).strip() or _OLLAMA_EMBED_MODEL
+    system_prompt_base = str(body.get("system_prompt_base", _SYSTEM_PROMPT_BASE)).strip()
+    chat_system_prompt = str(body.get("chat_system_prompt", _CHAT_SYSTEM_PROMPT)).strip()
+    ollama_chat_options = str(body.get("ollama_chat_options", json.dumps(_OLLAMA_CHAT_OPTIONS))).strip()
+    ollama_analyze_options = str(body.get("ollama_analyze_options", json.dumps(_OLLAMA_ANALYZE_OPTIONS))).strip()
+
+    updates = {
+        "LLM_PROVIDER": provider,
+        "OLLAMA_URL": ollama_url,
+        "OLLAMA_MODEL": ollama_model,
+        "OLLAMA_EMBED_MODEL": ollama_embed_model,
+        "GEMINI_API_KEY": gemini_api_key,
+        "SYSTEM_PROMPT_BASE": system_prompt_base,
+        "CHAT_SYSTEM_PROMPT": chat_system_prompt,
+        "OLLAMA_CHAT_OPTIONS": ollama_chat_options,
+        "OLLAMA_ANALYZE_OPTIONS": ollama_analyze_options,
+    }
+
+    try:
+        _write_env_file(updates)
+        _reload_provider_settings()
+    except Exception as exc:
+        return jsonify({"error": f"Could not write .env: {exc}"}), 500
+
+    return jsonify({"ok": True, "provider": provider}), 200
+
+
+@app.route("/provider")
+def get_provider():
+    """Return the active LLM provider and its available chat models."""
+    if _LLM_PROVIDER == "ollama":
+        models = [{"id": m, "label": m} for m in sorted(_VALID_CHAT_MODELS_OLLAMA)]
+        default = _OLLAMA_MODEL
+    else:
+        models = [
+            {"id": "gemini-2.5-flash", "label": "2.5 Flash (fast)"},
+            {"id": "gemini-2.5-pro",   "label": "2.5 Pro (deep)"},
+            {"id": "gemini-1.5-flash", "label": "1.5 Flash"},
+            {"id": "gemini-1.5-pro",   "label": "1.5 Pro"},
+        ]
+        default = _MODEL_NAME
+    return jsonify({"provider": _LLM_PROVIDER, "models": models, "default_model": default})
+
+
+@app.route("/ollama/status")
+def ollama_status():
+    try:
+        models = _ollama_list_models()
+        return jsonify({"running": True, "models": models}), 200
+    except Exception as exc:
+        return jsonify({"running": False, "models": [], "error": str(exc)}), 200
+
+
+@app.route("/ollama/pull", methods=["POST"])
+def ollama_pull():
+    body = request.get_json(silent=True) or {}
+    model = str(body.get("model", "")).strip()
+    if not model:
+        return jsonify({"error": "Model parameter required"}), 400
+
+    def generate():
+        yield json.dumps({"type": "started", "message": f"Pulling model {model}..."}) + "\n"
+        try:
+            client = _get_ollama_client()
+            for chunk in client.pull(model, stream=True):
+                if hasattr(chunk, "message") and chunk.message:
+                    text = str(chunk.message).strip()
+                    if text:
+                        yield json.dumps({"type": "progress", "line": text}) + "\n"
+                elif hasattr(chunk, "status"):
+                    yield json.dumps({"type": "progress", "line": str(chunk.status)}) + "\n"
+            yield json.dumps({"type": "complete", "model": model}) + "\n"
+        except Exception as exc:
+            yield json.dumps({"type": "error", "message": str(exc)}) + "\n"
+
+    return Response(stream_with_context(generate()), mimetype="application/x-ndjson")
+
+
+_OLLAMA_SERVE_PROCESS = None
+
+
+@app.route("/ollama/serve", methods=["POST"])
+def ollama_serve():
+    global _OLLAMA_SERVE_PROCESS
+    if _OLLAMA_SERVE_PROCESS and _OLLAMA_SERVE_PROCESS.poll() is None:
+        return jsonify({"ok": True, "message": "Ollama serve already running", "pid": _OLLAMA_SERVE_PROCESS.pid}), 200
+    try:
+        _OLLAMA_SERVE_PROCESS = subprocess.Popen(
+            ["ollama", "serve"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=os.getcwd(),
+            text=True,
+        )
+        return jsonify({"ok": True, "message": "Ollama serve started", "pid": _OLLAMA_SERVE_PROCESS.pid}), 200
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 
 @app.route("/entries/search")
@@ -2553,17 +3470,17 @@ def chat():
     body       = request.get_json(silent=True) or {}
     question   = (body.get("question") or "").strip()
     session_id = body.get("session_id")
-    model_name = (body.get("model") or _MODEL_NAME).strip()
+    model_name = (body.get("model") or _default_chat_model()).strip()
     pinned_ids = [int(x) for x in (body.get("pinned_ids") or []) if str(x).isdigit()]
 
     if not question:
         return jsonify({"error": "question required"}), 400
     if not session_id:
         return jsonify({"error": "session_id required"}), 400
-    if not _API_KEY:
+    if _LLM_PROVIDER == "gemini" and not _API_KEY:
         return jsonify({"error": "GEMINI_API_KEY not set"}), 500
     if model_name not in _VALID_CHAT_MODELS:
-        model_name = _MODEL_NAME
+        model_name = _default_chat_model()
 
     # Pre-flight: validate session exists (uses request-context DB, safe here)
     pre_db = get_db()
@@ -2593,7 +3510,6 @@ def chat():
                     f"SELECT * FROM entries WHERE id IN ({ph})", pinned_ids  # nosec B608 – ph contains only '?' placeholders
                 ).fetchall()
                 for row in entry_rows:
-                    # Pull ALL chunks ordered by index to reconstruct the full content
                     chunk_rows = sdb.execute(
                         "SELECT chunk_text FROM entry_chunks WHERE entry_id = ? ORDER BY chunk_index",
                         (row["id"],),
@@ -2608,6 +3524,7 @@ def chat():
             else:
                 # ── RAG retrieval ──────────────────────────────────────────
                 try:
+                    ollama_logger.debug("CHAT EMBED QUERY — question=%d chars", len(question))
                     query_emb = _get_embedding(question, task_type="RETRIEVAL_QUERY")
                 except Exception as exc:
                     yield json.dumps({"type": "error", "message": f"Embedding failed: {exc}"}) + "\n"
@@ -2616,6 +3533,25 @@ def chat():
                 chunks = sdb.execute(
                     "SELECT entry_id, chunk_text, embedding FROM entry_chunks"
                 ).fetchall()
+
+                total_entries   = sdb.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+                embedded_ids    = set(c["entry_id"] for c in chunks)
+                missing_count   = total_entries - len(embedded_ids) if total_entries else 0
+
+                if total_entries > 0 and missing_count > 0:
+                    logger.warning(
+                        "Chat RAG: %d / %d entries have no embeddings — "
+                        "run POST /entries/embed-required to rebuild",
+                        missing_count, total_entries,
+                    )
+                    yield json.dumps({
+                        "type": "no_rag",
+                        "message": f"{missing_count} of {total_entries} entries have no embeddings — "
+                                   "chat answers may be incomplete. Re-embed to enable full RAG.",
+                        "entry_count": missing_count,
+                    }) + "\n"
+                elif total_entries == 0:
+                    logger.info("Chat RAG: no entries in the knowledge base yet")
 
                 entry_scores: dict = {}
                 for chunk in chunks:
@@ -2631,7 +3567,7 @@ def chat():
                 top_entries = sorted(
                     [(eid, sc, txt) for eid, (sc, txt) in entry_scores.items() if sc > 0.2],
                     key=lambda x: -x[1],
-                )[:8]
+                )[:4]
 
                 if top_entries:
                     top_ids    = [eid for eid, _, _ in top_entries]
@@ -2656,40 +3592,91 @@ def chat():
                     "You are a cyber-security expert assistant. "
                     "The user has pinned specific articles/entries for this question. "
                     "Answer ONLY using the pinned entries provided below — do not draw on any other knowledge. "
-                    "Cite the entry names you used. "
+                    "Cite the entry names you used."
+                    "Do not use any internal data you have, just use the PINNED ENTRIES provided."
+                    "You are here to help answer the user's question using the PINNED ENTRIES. no addtional info and no corrections to user"
                     "If the answer is not in the pinned entries, say so explicitly.\n\n"
                     f"PINNED ENTRIES:\n{context_text}"
                 )
             else:
                 system_prompt = _CHAT_SYSTEM_PROMPT.format(context=context_text)
 
-            # ── Gemini conversation history ────────────────────────────────
-            gemini_contents = []
-            for role, text in history_data:
-                gemini_role = "model" if role == "assistant" else "user"
-                gemini_contents.append({"role": gemini_role, "parts": [{"text": text}]})
-            gemini_contents.append({"role": "user", "parts": [{"text": question}]})
-
             # ── Stream LLM response ────────────────────────────────────────
             try:
-                stream = _genai_client.models.generate_content_stream(
-                    model=model_name,
-                    contents=gemini_contents,
-                    config=genai_types.GenerateContentConfig(
-                        system_instruction=system_prompt,
-                        temperature=0.3,
-                        max_output_tokens=2048,
-                        thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
-                    ),
-                )
-                full_response = []
-                for chunk in stream:
-                    text = chunk.text or ""
-                    if text:
-                        full_response.append(text)
-                        yield json.dumps({"type": "chunk", "text": text}) + "\n"
+                if _LLM_PROVIDER == "ollama":
+                    messages = [{"role": "system", "content": system_prompt}]
+                    for role, text in history_data:
+                        messages.append({"role": role if role != "assistant" else "assistant", "content": text})
+                    messages.append({"role": "user", "content": question})
 
-                assembled = "".join(full_response)
+                    ollama_logger.debug(
+                        "CHAT REQUEST — model=%s, messages=%d, system=%d chars, question=%d chars",
+                        model_name, len(messages), len(system_prompt), len(question),
+                    )
+
+                    try:
+                        chat_client = _get_ollama_client()
+                        chat_stream = chat_client.chat(
+                            model=model_name,
+                            messages=messages,
+                            stream=True,
+                            think='high',
+                            options=_OLLAMA_CHAT_OPTIONS,
+                        )
+                    except _ollama_mod.ResponseError as e:
+                        raise RuntimeError(f"Ollama chat error: {e}") from e
+                    except Exception as e:
+                        if "connect" in str(e).lower() or "refused" in str(e).lower():
+                            raise EnvironmentError(
+                                f"Cannot connect to Ollama at {_OLLAMA_URL}. "
+                                f"Make sure Ollama is running (ollama serve) and the model is pulled:\n"
+                                f"  ollama pull {model_name}"
+                            ) from e
+                        raise
+
+                    full_response = []
+                    last_chunk = None
+                    for chunk in chat_stream:
+                        text = chunk.message.content or ""
+                        if text:
+                            # Strip <think>…</think> from streamed reasoning
+                            text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+                            if text:
+                                full_response.append(text)
+                                yield json.dumps({"type": "chunk", "text": text}) + "\n"
+                        last_chunk = chunk
+                    assembled = "".join(full_response)
+                    # Clean any partial <think> tags that spanned chunks
+                    assembled = re.sub(r"<think>.*?</think>", "", assembled, flags=re.DOTALL).strip()
+                    if last_chunk:
+                        ollama_logger.info(_extract_ollama_stats(last_chunk))
+                    ollama_logger.debug("CHAT RESPONSE (%d chars): %s", len(assembled), assembled[:500])
+                else:
+                    # Gemini streaming
+                    gemini_contents = []
+                    for role, text in history_data:
+                        gemini_role = "model" if role == "assistant" else "user"
+                        gemini_contents.append({"role": gemini_role, "parts": [{"text": text}]})
+                    gemini_contents.append({"role": "user", "parts": [{"text": question}]})
+
+                    stream = _genai_client.models.generate_content_stream(
+                        model=model_name,
+                        contents=gemini_contents,
+                        config=genai_types.GenerateContentConfig(
+                            system_instruction=system_prompt,
+                            temperature=0.3,
+                            max_output_tokens=2048,
+                            thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
+                        ),
+                    )
+                    full_response = []
+                    for chunk in stream:
+                        text = chunk.text or ""
+                        if text:
+                            full_response.append(text)
+                            yield json.dumps({"type": "chunk", "text": text}) + "\n"
+                    assembled = "".join(full_response)
+
                 sdb.execute(
                     "INSERT INTO chat_messages (session_id, role, text, sources) VALUES (?,?,?,?)",
                     (session_id, "user", question, "[]"),
@@ -2711,7 +3698,7 @@ def chat():
                     )
                 sdb.commit()
             except Exception as exc:
-                logger.error("Chat Gemini error: %s", exc)
+                logger.error("Chat LLM error: %s", exc)
                 yield json.dumps({"type": "error", "message": str(exc)}) + "\n"
                 return
 

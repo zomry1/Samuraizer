@@ -6,10 +6,12 @@
 
 <div align="center">
 
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/) [![React](https://img.shields.io/badge/react-v18-blueviolet)](https://reactjs.org/) [![Gemini](https://img.shields.io/badge/gemini-2.5%20Flash-orange)](https://cloud.google.com/vertex-ai) ![Built For](https://img.shields.io/badge/Built%20For-Security%20Researchers-red?style=flat-square) ![GitHub last commit](https://img.shields.io/github/last-commit/zomry1/Samuraizer?style=flat-square)
-
 **NotebookLM on steroids — purpose-built for security researchers.** 
+</br></br>
+[![Self-hosted](https://img.shields.io/badge/selfhosting-100%25-brightgreen)](README.md) ![Built For](https://img.shields.io/badge/Built%20For-Security%20Researchers-red?style=flat-square) <br>[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/) [![React](https://img.shields.io/badge/react-v18-blueviolet)](https://reactjs.org/) ![GitHub last commit](https://img.shields.io/github/last-commit/zomry1/Samuraizer?style=flat-square)
+
 </div>
+
 
 ## 💡 Why Samuraizer?
 
@@ -29,6 +31,15 @@ Every security researcher knows the feeling — you find an interesting GitHub r
 </tr>
 </table>
 </div>
+
+## 🔐 Local-first privacy (local-only feature)
+
+🎯 **Extra privacy mode (local only)** — run with `ollama`, all data stays on your machine.
+
+- 🗄️ Local vector storage in `samuraizer.db` + local AI embeddings via Ollama.
+- ⚡ Works fully offline once models are pulled (`ollama pull qwen3:4b`, `ollama pull qwen3-embedding:8b`).
+- ✅ Great for security teams and researchers who require air-gapped/isolated setups.
+
 
 ---
 
@@ -121,6 +132,7 @@ flowchart LR
   Frontend -->|REST/NDJSON| Backend[Flask API]
   Backend -->|SQL| SQLite[(samuraizer.db)]
   Backend -->|API| Gemini[Gemini 2.5 Flash]
+  Backend -->|local API| Ollama[Ollama - Local LLM]
   Backend -->|GitHub API| GitHub[GitHub]
   Backend -->|RSS| RSS[RSS feeds]
   Telegram[Telegram Bot] -->|HTTP| Backend
@@ -150,7 +162,7 @@ flowchart LR
 | Layer     | Tech / Libraries                      |
 |-----------|----------------------------------------|
 | Backend   | Python, Flask, SQLite, feedparser, PyMuPDF |
-| LLM       | Gemini 2.5 Flash (Gemini API)          |
+| LLM       | Gemini 2.5 Flash (Gemini API), Ollama (local optionally) |
 | Frontend  | React 18, Vite, Tailwind CSS           |
 | Bot       | python-telegram-bot v20                |
 | Transcripts | [transcriptapi.com](https://transcriptapi.com) |
@@ -160,8 +172,16 @@ flowchart LR
 
 ## ⚙️ Setup (Local)
 
+### 0) Clone the repo 📥
+
+```bash
+git clone https://github.com/zomry1/Samuraizer.git
+cd Samuraizer
+```
+
 ### 1) Config 🔐
-Copy `.env.example` to `.env` and fill in your keys:
+Copy `.env.example` to `.env` and fill in your values.
+You can also open the web UI, go to the **Settings** tab, and adjust settings there (provider, API keys, Ollama model names, embedding model names) before save.
 
 ```bash
 cp .env.example .env
@@ -169,11 +189,48 @@ cp .env.example .env
 
 | Variable | Required | Where to get it |
 |---|---|---|
-| `GEMINI_API_KEY` | ✅ Yes | [Google AI Studio → Get API key](https://aistudio.google.com/app/apikey) |
+| `LLM_PROVIDER` | No | `gemini` (default, cloud) or `ollama` (local) |
+| `GEMINI_API_KEY` | When `gemini` | [Google AI Studio → Get API key](https://aistudio.google.com/app/apikey) |
+| `OLLAMA_URL` | When `ollama` | Ollama API URL (default: `http://localhost:11434`) |
+| `OLLAMA_MODEL` | When `ollama` | Reasoning model (default: `qwen3:14b`) |
+| `OLLAMA_EMBED_MODEL` | When `ollama` | Embedding model (default: `qwen3-embedding:8b`) |
 | `TELEGRAM_BOT_TOKEN` | No | [Create a bot with @BotFather on Telegram](https://t.me/BotFather) |
 | `GITHUB_TOKEN` | No | [GitHub → Settings → Developer settings → Personal access tokens](https://github.com/settings/tokens) — raises API rate limit from 60 to 5,000 req/hr |
 | `TRANSCRIPTAPI` | No | [transcriptapi.com/dashboard/api-keys](https://transcriptapi.com/dashboard/api-keys) — required for YouTube transcript fetching |
 | `SAMURAIZER_URL` | No | URL of your backend (default: `http://localhost:8000`), used by the Telegram bot |
+
+<details>
+<summary><b>🏠 Local Mode (Ollama)</b></summary>
+
+Run Samuraizer fully offline with [Ollama](https://ollama.com):
+
+```bash
+# Install Ollama CLI (platform-dependent)
+# macOS
+curl -fsSL https://ollama.com/install.sh | sh
+
+# Windows
+irm https://ollama.com/install.ps1 | iex
+
+# Linux (Ubuntu/Debian)
+curl -fsSL https://ollama.com/install.sh | sh
+```
+
+```bash
+# Start Ollama service
+ollama serve
+
+# Install models
+ollama pull qwen3:4b            # reasoning
+ollama pull qwen3-embedding:8b  # embeddings
+
+# Set provider in .env
+LLM_PROVIDER=ollama
+```
+
+If you already have Gemini embeddings, switching to Ollama will automatically wipe them on next startup (dimension mismatch). Re-embed via the UI or `POST /entries/embed-all`.
+
+</details>
 
 ### 2) Install dependencies 📦
 
@@ -183,7 +240,10 @@ python -m venv .venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 
 pip install -r requirements.txt
-cd frontend && npm install
+
+cd frontend
+npm install
+cd ..
 ```
 
 ### 3) Run backend ▶️
@@ -192,14 +252,14 @@ cd frontend && npm install
 python server.py
 ```
 
-### 4) Run frontend 🌐
+### 4) Run frontend 🌐 *(new terminal)*
 
 ```bash
 cd frontend
 npm run dev
 ```
 
-### 5) (Optional) Run Telegram bot 🤖
+### 5) (Optional) Run Telegram bot 🤖 *(new terminal)*
 
 ```bash
 python telegram_bot.py

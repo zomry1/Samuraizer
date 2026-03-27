@@ -960,13 +960,28 @@ function ProgressItem({ item, lists, onAddToList, onRemoveFromList, onUpdate, cu
     );
   }
   if (item.status === "error") {
+    const ollamaMatch = item.error?.match(/^(Cannot connect to Ollama[^.]*\.)\s*(.*?):\s*\n([\s\S]*)$/);
+    const errorContent = ollamaMatch ? (
+      <div className="mt-1 space-y-1.5">
+        <div className="font-bold text-accent-red">{ollamaMatch[1]}</div>
+        <div className="text-accent-red/80">{ollamaMatch[2]}:</div>
+        <ol className="list-decimal list-inside space-y-1 text-accent-red/80 pl-1">
+          <li>Start Ollama: <code className="bg-accent-red/10 rounded px-1 py-0.5">ollama serve</code></li>
+          {ollamaMatch[3].trim().split("\n").map((cmd, i) => (
+            <li key={i}>Pull model: <code className="bg-accent-red/10 rounded px-1 py-0.5">{cmd.trim()}</code></li>
+          ))}
+        </ol>
+      </div>
+    ) : (
+      <div className="text-accent-red/70 mt-0.5">{item.error}</div>
+    );
     return (
       <div className="rounded border border-accent-red/30 bg-accent-red/5 overflow-hidden">
         <div className="flex items-start gap-2 px-4 py-3 text-xs text-accent-red">
           <span className="flex-shrink-0">✗</span>
           <div className="min-w-0">
             <div className="font-mono truncate">{item.url}</div>
-            <div className="text-accent-red/70 mt-0.5">{item.error}</div>
+            {errorContent}
           </div>
         </div>
         {item.logs.length > 0 && <LogLines logs={item.logs} />}
@@ -1732,7 +1747,7 @@ function parseUrls(raw) {
   )];
 }
 
-function AnalyzeTab({ input, setInput, loading, progress, onSubmit, onBlogSubmit, onPdfSubmit, lists, onAddToList, onRemoveFromList, onUpdate, customCats = [] }) {
+function AnalyzeTab({ input, setInput, loading, progress, onSubmit, onBlogSubmit, onPdfSubmit, lists, onAddToList, onRemoveFromList, onUpdate, customCats = [], llmProvider }) {
   const [blogInput,    setBlogInput]    = useState("");
   const [scanState,    setScanState]    = useState("idle"); // idle | scanning | results
   const [scanError,    setScanError]    = useState("");
@@ -1895,6 +1910,15 @@ function AnalyzeTab({ input, setInput, loading, progress, onSubmit, onBlogSubmit
           )}
         </div>
       </div>
+
+      {llmProvider === "ollama" && (
+        <div className="mt-4 flex items-start gap-2 rounded border border-accent-yellow/30 bg-accent-yellow/5 px-4 py-2.5 text-xs text-accent-yellow">
+          <span className="flex-shrink-0 text-sm leading-none">⚡</span>
+          <span>
+            <strong>Local mode (Ollama)</strong> — Analysis speed depends on your hardware (GPU, RAM). First request may be slower while the model loads into memory.
+          </span>
+        </div>
+      )}
 
       {progress.length > 0 && (
         <div className="mt-6 space-y-3">
@@ -2076,9 +2100,32 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
   async function handleEmbedAll() {
     setEmbedProgress("loading");
     try {
-      const res  = await fetch(`${API}/entries/embed-all`, { method: "POST" });
-      const data = await res.json();
-      setEmbedProgress(data);
+      const res = await fetch(`${API}/entries/embed-required`, { method: "POST" });
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      let result = null;
+      while (true) {
+        const { done: streamDone, value } = await reader.read();
+        if (value) buf += decoder.decode(value, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf("\n")) !== -1) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (!line) continue;
+          try {
+            const evt = JSON.parse(line);
+            if (evt.type === "progress") {
+              setEmbedProgress({ done: evt.done, total: evt.total, failed: evt.failed, name: evt.name });
+            } else if (evt.type === "complete") {
+              result = evt;
+            }
+          } catch {}
+        }
+        if (streamDone) break;
+      }
+      if (result) setEmbedProgress({ done: result.done, failed: result.failed });
+      else setEmbedProgress({ done: 0, failed: -1 });
     } catch (e) { setEmbedProgress({ done: 0, failed: -1 }); }
   }
 
@@ -2393,14 +2440,17 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
             <span>Searching by meaning using Gemini embeddings</span>
             <div className="flex items-center gap-2">
               {embedProgress === "loading" && <><Spinner sm /><span>Embedding entries…</span></>}
-              {embedProgress && embedProgress !== "loading" && (
+              {embedProgress && embedProgress !== "loading" && embedProgress.total && (
+                <span className="text-accent-blue"><Spinner sm /> Embedding {embedProgress.done} / {embedProgress.total}…</span>
+              )}
+              {embedProgress && embedProgress !== "loading" && !embedProgress.total && (
                 <span className={embedProgress.failed < 0 ? "text-accent-red" : "text-accent-green"}>
                   {embedProgress.failed < 0 ? "Error" : `✓ ${embedProgress.done} embedded${embedProgress.failed > 0 ? `, ${embedProgress.failed} failed` : ""}`}
                 </span>
               )}
-              <button onClick={handleEmbedAll} disabled={embedProgress === "loading"}
+              <button onClick={handleEmbedAll} disabled={embedProgress === "loading" || (embedProgress && embedProgress.total)}
                 className="px-2 py-1 rounded border border-accent-purple/40 text-accent-purple hover:bg-accent-purple/10 transition-colors disabled:opacity-40">
-                Embed all entries
+                Re-embed required entries
               </button>
             </div>
           </div>
@@ -2503,7 +2553,7 @@ function KnowledgeBaseTab({ refreshKey, lists, onListsChange, onAddToList, onRem
 
 // ─── chat ─────────────────────────────────────────────────────────────────────
 
-const CHAT_MODELS = [
+const FALLBACK_CHAT_MODELS = [
   { id: "gemini-2.5-flash", label: "2.5 Flash (fast)" },
   { id: "gemini-2.5-pro",   label: "2.5 Pro (deep)" },
   { id: "gemini-1.5-flash", label: "1.5 Flash" },
@@ -2594,13 +2644,15 @@ function renderMarkdownChunk(text) {
   return html;
 }
 
-function ChatTab() {
+function ChatTab({ reembedProgress }) {
   const [sessions,       setSessions]       = useState([]);
   const [activeSession,  setActiveSession]  = useState(null);
   const [messages,       setMessages]       = useState([]);
   const [chatInput,      setChatInput]      = useState("");
   const [chatLoading,    setChatLoading]    = useState(false);
-  const [model,          setModel]          = useState("gemini-2.5-flash");
+  const [model,          setModel]          = useState("");
+  const [chatModels,     setChatModels]     = useState(FALLBACK_CHAT_MODELS);
+  const [defaultModel,   setDefaultModel]   = useState("gemini-2.5-flash");
   const [renamingId,     setRenamingId]     = useState(null);
   const [renameVal,      setRenameVal]      = useState("");
   // Pinned entries & autocomplete
@@ -2612,13 +2664,39 @@ function ChatTab() {
   const [showBrowse,     setShowBrowse]     = useState(false);
   const [browseSearch,   setBrowseSearch]   = useState("");
   const [browseResults,  setBrowseResults]  = useState([]);
+  // RAG warning
+  const [ragWarning,     setRagWarning]     = useState(null);   // {message, entry_count} | null
+  const [localEmbedding, setLocalEmbedding] = useState(null);  // {active, done, total}
+  const embedding = reembedProgress || localEmbedding;
 
   const bottomRef   = useRef(null);
   const textareaRef = useRef(null);
 
-  // Load sessions on mount
+  // Load sessions and provider info on mount
   useEffect(() => {
     fetch(`${API}/chat/sessions`).then(r => r.json()).then(setSessions).catch(console.error);
+    fetch(`${API}/provider`).then(r => r.json()).then(data => {
+      if (data.models?.length) setChatModels(data.models);
+      if (data.default_model) {
+        setDefaultModel(data.default_model);
+        setModel(prev => prev || data.default_model);
+      }
+    }).catch(() => {
+      setModel(prev => prev || "gemini-2.5-flash");
+    });
+    // Check embedding health
+    fetch(`${API}/embeddings/status`).then(r => r.json()).then(data => {
+      if (data.ok === false && !data.error) {
+        const missing = Math.max(0, data.missing || 0);
+        if (missing > 0) {
+          const modelLabel = data.model ? ` for ${data.model}` : "";
+          setRagWarning({
+            message: `${missing} of ${data.total || 0} entries need embedding${modelLabel}. Chat answers may be incomplete until you re-embed.`,
+            entry_count: missing,
+          });
+        }
+      }
+    }).catch(() => {});
   }, []);
 
   // Auto-scroll to bottom when messages change
@@ -2649,7 +2727,7 @@ function ChatTab() {
 
   async function loadSession(session) {
     setActiveSession(session);
-    setModel(session.model || "gemini-2.5-flash");
+    setModel(session.model || defaultModel);
     setPinnedEntries([]);
     const msgs = await fetch(`${API}/chat/sessions/${session.id}/messages`)
       .then(r => r.json()).catch(() => []);
@@ -2773,7 +2851,9 @@ function ChatTab() {
         for (const line of lines) {
           if (!line.trim()) continue;
           let msg; try { msg = JSON.parse(line); } catch { continue; }
-          if (msg.type === "sources") {
+          if (msg.type === "no_rag") {
+            setRagWarning({ message: msg.message, entry_count: msg.entry_count });
+          } else if (msg.type === "sources") {
             setMessages(prev => {
               const next = [...prev];
               next[next.length - 1] = { ...next[next.length - 1], sources: msg.entries };
@@ -2874,7 +2954,7 @@ function ChatTab() {
           <select value={model} onChange={e => setModel(e.target.value)}
             disabled={!!activeSession}
             className="bg-surface-1 border border-border text-gray-300 text-xs px-2 py-1 rounded outline-none disabled:opacity-50">
-            {CHAT_MODELS.map(m => (
+            {chatModels.map(m => (
               <option key={m.id} value={m.id}>{m.label}</option>
             ))}
           </select>
@@ -2882,6 +2962,90 @@ function ChatTab() {
             <span className="text-[10px] text-gray-700">model locked to session — start a new chat to change</span>
           )}
         </div>
+
+        {/* Re-embed progress banner */}
+        {embedding?.active && (
+          <div className="mb-3 flex items-center gap-3 rounded border border-blue-500/40 bg-blue-500/10 px-4 py-2.5 text-xs text-blue-200 flex-shrink-0">
+            <span className="text-base">⏳</span>
+            <span className="flex-1">
+              Embedding {embedding.done} / {embedding.total}…
+            </span>
+          </div>
+        )}
+
+        {/* RAG warning toast */}
+        {ragWarning && (
+          <div className="mb-3 flex items-center gap-3 rounded border border-amber-500/40 bg-amber-500/10 px-4 py-2.5 text-xs text-amber-300 flex-shrink-0">
+            <span className="text-base">⚠</span>
+            <span className="flex-1">
+              {ragWarning.message}
+            </span>
+            <button
+              disabled={embedding?.active}
+              onClick={async () => {
+                setLocalEmbedding({ active: true, done: 0, total: 0 });
+                try {
+                  const res = await fetch(`${API}/entries/embed-required`, { method: "POST" });
+                  const reader = res.body.getReader();
+                  const decoder = new TextDecoder();
+                  let buf = "";
+                  let result = null;
+                  while (true) {
+                    const { done: streamDone, value } = await reader.read();
+                    if (value) buf += decoder.decode(value, { stream: true });
+                    let nl;
+                    while ((nl = buf.indexOf("\n")) !== -1) {
+                      const line = buf.slice(0, nl).trim();
+                      buf = buf.slice(nl + 1);
+                      if (!line) continue;
+                      try {
+                        const evt = JSON.parse(line);
+                        if (evt.type === "progress") {
+                          setLocalEmbedding({ active: true, done: evt.done, total: evt.total });
+                        } else if (evt.type === "complete") {
+                          result = evt;
+                        }
+                      } catch {}
+                    }
+                    if (streamDone) break;
+                  }
+                  setRagWarning(null);
+                  // Re-check status in case not everything got fixed
+                  fetch(`${API}/embeddings/status`).then(r => r.json()).then(st => {
+                    if (!st.ok && !st.error) {
+                      const bad = st.missing || 0;
+                      if (bad > 0) {
+                        setRagWarning({ message: `Still ${bad} entries need embedding.`, entry_count: bad });
+                      }
+                    }
+                  }).catch(() => {});
+                  const r = result || { done: 0, failed: 0 };
+                  if (r.done > 0 || r.failed > 0) {
+                    setMessages(prev => [...prev, {
+                      role: "assistant",
+                      text: `✅ Embeddings regenerated — ${r.done} entries embedded${r.failed ? `, ${r.failed} failed` : ""}. Ask your question again for RAG-powered answers.`,
+                      sources: [],
+                    }]);
+                  } else {
+                    // no actual work done (up to date), no repetitive message
+                  }
+                } catch (e) {
+                  setMessages(prev => [...prev, { role: "assistant", text: `⚠ Embed failed: ${e.message}`, sources: [] }]);
+                } finally {
+                  setLocalEmbedding(null);
+                }
+              }}
+              className="whitespace-nowrap rounded border border-amber-500/50 bg-amber-500/20 px-3 py-1 text-amber-200 font-bold uppercase tracking-wider hover:bg-amber-500/30 transition-colors disabled:opacity-50"
+            >
+              {embedding && embedding.active
+                ? embedding.total > 0
+                  ? `Embedding ${embedding.done} / ${embedding.total}…`
+                  : "Embedding…"
+                : "Embed All Entries"}
+            </button>
+            <button onClick={() => setRagWarning(null)} className="text-amber-500/60 hover:text-amber-300 text-sm">✕</button>
+          </div>
+        )}
 
         {/* Messages */}
         <div className="flex-1 overflow-y-auto space-y-4 pr-1" style={{ minHeight: 0 }}>
@@ -3068,6 +3232,7 @@ const LEVELS      = ["ALL", "DEBUG", "INFO", "WARNING", "ERROR"];
 function LogsTab() {
   const [logs, setLogs]             = useState([]);
   const [levelFilter, setLevelFilter] = useState("ALL");
+  const [nameFilter, setNameFilter]   = useState("ALL"); // "ALL" | "ollama"
   const [autoScroll, setAutoScroll]   = useState(true);
   const lastIdRef  = useRef(0);
   const bottomRef  = useRef(null);
@@ -3116,9 +3281,13 @@ function LogsTab() {
 
   // Computed directly (no useMemo) so levelFilter is always the current render value
   const minOrd  = levelFilter === "ALL" ? 0 : (LEVEL_ORDER[levelFilter] ?? 0);
-  const visible = levelFilter === "ALL"
-    ? logs
-    : logs.filter(l => (LEVEL_ORDER[l.level] ?? 20) >= minOrd);
+  const visible = logs.filter(l => {
+    if (levelFilter !== "ALL" && (LEVEL_ORDER[l.level] ?? 20) < minOrd) return false;
+    if (nameFilter === "ollama" && l.name !== "ollama") return false;
+    return true;
+  });
+
+  const ollamaCount = useMemo(() => logs.filter(l => l.name === "ollama").length, [logs]);
 
   const activeBtnCls = {
     ALL:     "bg-accent-green/10 text-accent-green border-accent-green/40",
@@ -3142,6 +3311,15 @@ function LogsTab() {
             </button>
           ))}
         </div>
+        <div className="w-px h-5 bg-gray-700" />
+        <button onClick={() => setNameFilter(f => f === "ollama" ? "ALL" : "ollama")}
+          className={`px-2.5 py-0.5 rounded border text-xs font-bold uppercase tracking-wide transition-colors
+            ${nameFilter === "ollama"
+              ? "bg-purple-900/30 text-purple-400 border-purple-500/40"
+              : "text-gray-600 border-gray-800 hover:text-gray-400 hover:border-gray-600"}`}>
+          🦙 OLLAMA
+          {ollamaCount > 0 && <span className="ml-1 opacity-60">{ollamaCount}</span>}
+        </button>
         <label className="flex items-center gap-1.5 text-xs text-gray-500 cursor-pointer select-none ml-auto">
           <input type="checkbox" checked={autoScroll} onChange={e => setAutoScroll(e.target.checked)}
             className="accent-accent-green" />
@@ -3175,6 +3353,517 @@ function LogsTab() {
   );
 }
 
+function SettingsTab({ settings, onChange, onSave, saving, status, error, ollamaStatus, ollamaStatusLoading, refreshOllamaStatus, startOllamaServe, onReembedProgress, reembedProgress }) {
+  const [localSettings, setLocalSettings] = useState(settings || {});
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [pullingModel, setPullingModel] = useState(false);
+  const [pullLogs, setPullLogs] = useState([]);
+  const [pullStatus, setPullStatus] = useState("");
+  const [embedConfirmOpen, setEmbedConfirmOpen] = useState(false);
+  // display global progress in settings page too
+  const activeReembed = reembedProgress?.active;
+  const reembedDone = reembedProgress?.done || 0;
+  const reembedTotal = reembedProgress?.total || 0;
+  const [pendingEmbedModel, setPendingEmbedModel] = useState("");
+  const [reembedStatus, setReembedStatus] = useState("");
+  const [reembedLogs, setReembedLogs] = useState([]);
+  const [reembedError, setReembedError] = useState("");
+  const reembedLogRef = useRef(null);
+  const pullLogRef = useRef(null);
+
+  useEffect(() => {
+    if (settings) {
+      setLocalSettings(settings);
+    }
+  }, [settings]);
+
+  if (!settings) {
+    return <div>Loading settings…</div>;
+  }
+
+  const provider = localSettings.provider || "ollama";
+  const ollamaModels = localSettings.ollama_models || ["qwen3:4b", "qwen3:14b", "qwen3:22b", "qwen3:70b"];
+  const ollamaEmbedModels = localSettings.ollama_embedding_models || ["qwen3-embedding:8b", "qwen3-embedding:14b"];
+  const isOllamaBusy = ollamaStatusLoading || pullingModel;
+
+  const installedModels = (ollamaStatus?.models || []).map(m => m.name);
+  const selectedModel = localSettings.ollama_model || "";
+  const needsPull = provider === "ollama" && selectedModel && !installedModels.includes(selectedModel);
+  const embedModel = localSettings.ollama_embed_model || "";
+  const embedNeedsPull = provider === "ollama" && embedModel && !installedModels.includes(embedModel);
+
+  const analyzePromptValid = (localSettings.system_prompt_base || "").includes("{categories}") && (localSettings.system_prompt_base || "").includes("{custom_section}");
+  const chatPromptValid = (localSettings.chat_system_prompt || "").includes("{context}");
+  const settingsValid = analyzePromptValid && chatPromptValid;
+
+  const selectedModelBorderClass = (!selectedModel || installedModels.includes(selectedModel))
+    ? "border-border"
+    : "border-red-500";
+  const selectedEmbedBorderClass = (!embedModel || installedModels.includes(embedModel))
+    ? "border-border"
+    : "border-red-500";
+
+  useEffect(() => {
+    if (reembedLogRef.current) {
+      reembedLogRef.current.scrollTop = reembedLogRef.current.scrollHeight;
+    }
+  }, [reembedLogs]);
+
+  useEffect(() => {
+    if (pullLogRef.current) {
+      pullLogRef.current.scrollTop = pullLogRef.current.scrollHeight;
+    }
+  }, [pullLogs]);
+
+  async function pullModel(model = selectedModel) {
+    if (!model) return;
+    setPullingModel(true);
+    setPullStatus("Pull in progress...");
+    setPullLogs([`Starting pull: ${model}`]);
+    const seenPullLines = new Set();
+
+    function appendUniqueLog(line) {
+      if (!seenPullLines.has(line)) {
+        seenPullLines.add(line);
+        setPullLogs(prev => [...prev, line]);
+      }
+    }
+
+    try {
+      const res = await fetch(`${API}/ollama/pull`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model }),
+      });
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (value) buf += decoder.decode(value, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf("\n")) !== -1) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (!line) continue;
+          try {
+            const evt = JSON.parse(line);
+            if (evt.type === "progress") {
+              appendUniqueLog(evt.line);
+            } else if (evt.type === "started") {
+              appendUniqueLog(evt.message);
+            } else if (evt.type === "complete") {
+              appendUniqueLog(`Pull complete: ${evt.model}`);
+              setPullStatus("Success: model pulled");
+              if (model === localSettings.ollama_embed_model) {
+                setReembedError("");
+              }
+            } else if (evt.type === "error") {
+              appendUniqueLog(`Error: ${evt.message}`);
+              setPullStatus(`Error: ${evt.message}`);
+            }
+          } catch (err) {
+            appendUniqueLog(line);
+          }
+        }
+        if (done) break;
+      }
+      await refreshOllamaStatus();
+      if (model === localSettings.ollama_embed_model) {
+        setReembedError("");
+        // Automatically prompt re-embed now that model is available
+        setPendingEmbedModel(model);
+        setEmbedConfirmOpen(true);
+      }
+    } catch (err) {
+      const msg = err.message || String(err);
+      setPullLogs(prev => [...prev, `Pull failed: ${msg}`]);
+      setPullStatus(`Error: ${msg}`);
+    } finally {
+      setPullingModel(false);
+    }
+  }
+
+  async function onEmbedModelSelect(newModel) {
+    if (!newModel || newModel === embedModel) {
+      return;
+    }
+
+    setLocalSettings({ ...localSettings, ollama_embed_model: newModel });
+    setPendingEmbedModel(newModel);
+
+    if (!installedModels.includes(newModel)) {
+      setReembedError(`Embedding model ${newModel} is not installed yet. Pull it first.`);
+      setEmbedConfirmOpen(false);
+      return;
+    }
+
+    setReembedError("");
+    setEmbedConfirmOpen(true);
+  }
+
+  async function confirmEmbedModelChange() {
+    if (!pendingEmbedModel) return;
+    if (!installedModels.includes(pendingEmbedModel)) {
+      setReembedError(`Embedding model ${pendingEmbedModel} is not installed yet. Pull it first.`);
+      setEmbedConfirmOpen(false);
+      return;
+    }
+
+    const old = localSettings.ollama_embed_model;
+    const newSettings = { ...localSettings, ollama_embed_model: pendingEmbedModel };
+    setLocalSettings(newSettings);
+
+    // Persist immediately even if user has not clicked Save.
+    await onSave(newSettings);
+
+    setEmbedConfirmOpen(false);
+    setPendingEmbedModel("");
+    setReembedStatus(`Re-embedding entries for new model ${pendingEmbedModel}...`);
+    setReembedError("");
+    setReembedLogs([`Embed model changed from ${old || "(unset)"} to ${pendingEmbedModel}.`]);
+    onReembedProgress?.({ active: true, done: 0, total: 0 });
+
+    try {
+      const res = await fetch(`${API}/entries/embed-all?all=true`, { method: "POST" });
+      if (!res.ok) {
+        const body = await res.text();
+        throw new Error(`${res.status}: ${body}`);
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (value) buf += decoder.decode(value, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf("\n")) !== -1) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (!line) continue;
+          try {
+            const evt = JSON.parse(line);
+            if (evt.type === "progress") {
+              setReembedLogs(prev => [...prev, `progress ${evt.done || 0}/${evt.total || "?"} ${evt.name || ""}`]);
+              onReembedProgress?.({ active: true, done: evt.done || 0, total: evt.total || 0 });
+            } else if (evt.type === "complete") {
+              setReembedLogs(prev => [...prev, `Embedding complete: ${evt.done}/${evt.total} done (${evt.failed} failed)`]);
+              setReembedStatus("Re-embedding complete");
+              onReembedProgress?.({ active: false, done: evt.done || 0, total: evt.total || 0 });
+            } else if (evt.type === "error") {
+              setReembedLogs(prev => [...prev, `Error: ${evt.message}`]);
+              setReembedStatus(`Error: ${evt.message}`);
+              onReembedProgress?.(null);
+            }
+          } catch (_err) {
+            setReembedLogs(prev => [...prev, line]);
+          }
+        }
+        if (done) break;
+      }
+    } catch (err) {
+      const msg = err.message || String(err);
+      setReembedLogs(prev => [...prev, `Re-embed failed: ${msg}`]);
+      setReembedStatus(`Error: ${msg}`);
+    }
+  }
+
+  function cancelEmbedChange() {
+    setEmbedConfirmOpen(false);
+    setPendingEmbedModel("");
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="p-4 border border-border rounded bg-surface-1">
+        {activeReembed && (
+          <div className="mb-3 rounded border border-blue-500/40 bg-blue-500/10 px-2 py-1 text-xs text-blue-200">
+            ⏳ Re-embedding: {reembedDone} / {reembedTotal} entries
+          </div>
+        )}
+        <h2 className="text-sm font-bold mb-3">LLM Provider</h2>
+        <div className="flex gap-4">
+          <label className="inline-flex items-center gap-2 text-xs">
+            <input type="radio" checked={provider === "gemini"} onChange={() => setLocalSettings({ ...localSettings, provider: "gemini" })} />
+            Gemini
+          </label>
+          <label className="inline-flex items-center gap-2 text-xs">
+            <input type="radio" checked={provider === "ollama"} onChange={() => setLocalSettings({ ...localSettings, provider: "ollama" })} />
+            Ollama
+          </label>
+        </div>
+      </div>
+
+      {provider === "gemini" && (
+        <div className="p-4 border border-border rounded bg-surface-1 space-y-2">
+          <label className="block text-xs font-bold">Gemini API Key</label>
+          <input type="text" value={settings.gemini_api_key || ""}
+            onChange={e => onChange({ ...settings, gemini_api_key: e.target.value })}
+            className="w-full px-2 py-2 rounded border border-border bg-surface focus:outline-none focus:ring-2 focus:ring-accent-green" />
+          <p className="text-[11px] text-gray-500">Set your GEMINI_API_KEY here. This overwrites .env on save.</p>
+        </div>
+      )}
+
+      {provider === "ollama" && (
+        <div className="relative p-4 border border-border rounded bg-surface-1 space-y-3">
+          {isOllamaBusy && (
+            <div className="absolute inset-0 z-20 bg-black/20 backdrop-blur-sm flex items-center justify-center pointer-events-none">
+              <div className="inline-flex items-center gap-2 text-xs text-white">
+                <span className="h-3 w-3 rounded-full border-2 border-white border-t-transparent animate-spin"/>
+                Working...
+              </div>
+            </div>
+          )}
+          <div className="grid grid-cols-1 gap-3">
+            <label className="block text-xs font-bold">Ollama URL</label>
+            <input type="text" value={localSettings.ollama_url || ""}
+              onChange={e => setLocalSettings({ ...localSettings, ollama_url: e.target.value })}
+              className="w-full px-2 py-2 rounded border border-border bg-surface focus:outline-none focus:ring-2 focus:ring-accent-green" />
+            <p className="text-[11px] text-gray-500">Ollama server URL (default: http://localhost:11434).</p>
+          </div>
+
+          <div className="flex items-center justify-between gap-2 p-3 rounded border border-border bg-black/5 text-xs">
+            <span>
+              Ollama status: <strong>{ollamaStatusLoading ? "Checking…" : ollamaStatus?.running ? "Running" : "Stopped"}</strong>
+            </span>
+            <div className="flex gap-2">
+              <button onClick={refreshOllamaStatus} disabled={ollamaStatusLoading || pullingModel} className="px-2 py-1 bg-surface-2 border border-border rounded text-[11px] disabled:opacity-50 disabled:cursor-wait">Refresh</button>
+              {!ollamaStatus?.running && !ollamaStatusLoading && (
+                <button onClick={startOllamaServe} className="px-2 py-1 bg-yellow-500 text-black rounded text-[11px]">Start ollama serve</button>
+              )}
+            </div>
+          </div>
+
+          {ollamaStatusLoading ? (
+            <div className="p-4 rounded border border-border bg-surface text-center text-sm text-gray-400 flex items-center justify-center gap-2" style={{ opacity: 0, animation: "fadeIn 0.35s ease-out forwards" }}>
+              <span className="h-4 w-4 rounded-full border-2 border-gray-300 border-t-transparent animate-spin" />
+              <span>Loading Ollama model metadata…</span>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 gap-3 fade-in">
+            <label className="block text-xs font-bold">Installed Ollama models</label>
+            <div className="min-h-[72px] p-2 rounded border border-border bg-surface overflow-auto text-[11px]">
+              {ollamaStatus?.models?.length ? ollamaStatus.models.map(m => {
+                const isInstalled = m.status?.toLowerCase().includes("installed")
+                  || m.name === selectedModel
+                  || m.name === localSettings.ollama_embed_model;
+                return (
+                  <div key={m.name} className="flex items-center gap-2">
+                    <span>{m.name} ({m.size ? `${(m.size/1024/1024/1024).toFixed(1)}GB` : "unknown"})</span>
+                    {isInstalled && (
+                      <span className="text-[10px] bg-accent-green/20 text-accent-green px-1.5 py-0.5 rounded">Installed</span>
+                    )}
+                  </div>
+                );
+              }) : <span className="text-gray-500">No models found</span>}
+            </div>
+          </div>
+          )}
+
+          <div className="grid grid-cols-1 gap-3">
+            <label className="block text-xs font-bold">General model</label>
+            <select value={localSettings.ollama_model || "qwen3:4b"}
+              onChange={e => setLocalSettings({ ...localSettings, ollama_model: e.target.value })}
+              className={`w-full px-2 py-2 rounded border ${selectedModelBorderClass} bg-surface focus:outline-none focus:ring-2 focus:ring-accent-green`}>
+              {ollamaModels.map(m => {
+                const isInstalled = installedModels.includes(m);
+                return (
+                  <option key={m} value={m}>
+                    {isInstalled ? "✅ " : "⚪ "}{m}
+                  </option>
+                );
+              })}
+            </select>
+            <p className={`text-[11px] ${needsPull ? "text-red-300" : "text-gray-500"}`}>Suggested: qwen3:4b</p>
+            {needsPull && (
+              <div className="mt-2 p-2 bg-surface-2 border border-red-500/50 rounded text-xs text-red-200">
+                Selected model is not installed.
+                <button onClick={pullModel} disabled={pullingModel}
+                  className="ml-1 text-accent-blue font-bold underline"
+                >{pullingModel ? "Pulling…" : "Pull model now"}</button>
+              </div>
+            )}
+          </div>
+          <div className="grid grid-cols-1 gap-3">
+            <label className="block text-xs font-bold">Embedding model</label>
+            <select value={localSettings.ollama_embed_model || "qwen3-embedding:8b"}
+              onChange={e => onEmbedModelSelect(e.target.value)}
+              className={`w-full px-2 py-2 rounded border ${selectedEmbedBorderClass} bg-surface focus:outline-none focus:ring-2 focus:ring-accent-green`}>
+              {ollamaEmbedModels.map(m => {
+                const installed = installedModels.includes(m);
+                return (
+                  <option key={m} value={m}>
+                    {installed ? "✅ " : "⚪ "}{m}
+                  </option>
+                );
+              })}
+            </select>
+            <p className={`text-[11px] ${embedNeedsPull ? "text-red-300" : "text-gray-500"}`}>Suggested: qwen3-embedding:8b</p>
+            {embedModel && embedNeedsPull && (
+              <div className="mt-2 p-2 bg-surface-2 border border-red-500/50 rounded text-xs text-red-200">
+                Embedding model is not installed.
+                <button
+                  onClick={() => pullModel(embedModel)} disabled={pullingModel}
+                  className="ml-1 inline-flex items-center gap-1 text-accent-blue font-bold underline disabled:opacity-50 disabled:cursor-wait"
+                >
+                  {pullingModel ? (
+                    <><span className="h-3 w-3 rounded-full border-2 border-current border-t-transparent animate-spin" />Pulling…</>
+                  ) : (
+                    <>Pull model now</>
+                  )}
+                </button>
+              </div>
+            )}
+          </div>
+
+          {pullStatus && (
+            <div className={`p-2 rounded border text-xs font-semibold ${pullStatus.startsWith('Error') ? 'text-accent-red border-accent-red/30 bg-red-950/20' : 'text-accent-green border-accent-green/30 bg-accent-green/10'}`}>
+              {pullStatus}
+            </div>
+          )}
+
+          {reembedStatus && (
+            <div className={`p-2 rounded border text-xs font-semibold ${reembedStatus.startsWith('Error') ? 'text-accent-red border-accent-red/30 bg-red-950/20' : 'text-accent-green border-accent-green/30 bg-accent-green/10'}`}>
+              {reembedStatus}
+            </div>
+          )}
+          {reembedError && (
+            <div className="p-2 rounded border border-accent-red/30 text-accent-red text-xs">
+              {reembedError}
+            </div>
+          )}
+
+          {reembedLogs.length > 0 && (
+            <div ref={reembedLogRef} className="p-2 rounded border border-border bg-surface-2 text-xs font-mono max-h-40 overflow-auto">
+              {reembedLogs.map((l, i) => {
+                const isError = l.toLowerCase().includes("error");
+                const isComplete = l.toLowerCase().includes("complete");
+                return (
+                  <div key={i} className={`py-0.5 ${isError ? "text-red-300" : ""} ${isComplete ? "text-emerald-300" : ""}`}>
+                    {l}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {embedConfirmOpen && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+              <div className="w-full max-w-md rounded border border-border bg-surface p-4">
+                <h3 className="text-sm font-bold mb-2">Change embedding model?</h3>
+                <p className="text-[12px] mb-3">
+                  Switching the embedding model requires re-embedding every entry in the database.
+                  This operation can take a while. Do you want to continue?
+                </p>
+                <div className="flex justify-end gap-2">
+                  <button onClick={cancelEmbedChange} className="px-2 py-1 rounded border border-border text-xs">Cancel</button>
+                  <button onClick={confirmEmbedModelChange} className="px-2 py-1 rounded bg-accent-green text-black text-xs">Re-embed</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {pullLogs.length > 0 && (
+            <div className="p-2 rounded border border-border bg-surface-2 text-xs font-mono max-h-40 overflow-auto">
+              {pullLogs.map((l, i) => {
+                const isError = l.toLowerCase().includes("error");
+                const isComplete = l.toLowerCase().includes("complete");
+                return (
+                  <div
+                    key={i}
+                    className={`py-0.5 ${isError ? "text-red-300" : ""} ${isComplete ? "text-emerald-300" : ""}`}
+                  >
+                    {l}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          <div className="p-3 border border-border rounded bg-surface-2">
+            <button onClick={() => setAdvancedOpen(prev => !prev)}
+              className="text-xs font-bold text-accent-blue hover:text-accent-green">
+              {advancedOpen ? "Hide" : "Show"} advanced Ollama settings
+            </button>
+            {advancedOpen && (
+              <div className="space-y-3 mt-3">
+                <div>
+                  <label className="block text-xs font-bold">System prompt (analyze)</label>
+                  <textarea
+                    value={localSettings.system_prompt_base || ""}
+                    onChange={e => setLocalSettings({ ...localSettings, system_prompt_base: e.target.value })}
+                    rows={6}
+                    className="w-full p-2 rounded border border-border bg-surface text-xs font-mono"
+                  />
+                  {!analyzePromptValid && (
+                    <p className="text-[11px] text-accent-red mt-1">
+                      Analyze system prompt must include <code>{"{categories}"}</code> and <code>{"{custom_section}"}</code>.
+                    </p>
+                  )}
+                </div>
+
+                <div>
+                  <label className="block text-xs font-bold">System prompt (chat)</label>
+                  <textarea
+                    value={localSettings.chat_system_prompt || ""}
+                    onChange={e => setLocalSettings({ ...localSettings, chat_system_prompt: e.target.value })}
+                    rows={4}
+                    className="w-full p-2 rounded border border-border bg-surface text-xs font-mono"
+                  />
+                  {!chatPromptValid && (
+                    <p className="text-[11px] text-accent-red mt-1">
+                      Chat system prompt must include <code>{"{context}"}</code> (includes pulled KB context).
+                    </p>
+                  )}
+                </div>
+
+                <div>
+                  <label className="block text-xs font-bold">Ollama chat options (JSON)</label>
+                  <textarea
+                    value={localSettings.ollama_chat_options || ""}
+                    onChange={e => setLocalSettings({ ...localSettings, ollama_chat_options: e.target.value })}
+                    rows={4}
+                    className="w-full p-2 rounded border border-border bg-surface text-xs font-mono"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-bold">Ollama analyze options (JSON)</label>
+                  <textarea
+                    value={localSettings.ollama_analyze_options || ""}
+                    onChange={e => setLocalSettings({ ...localSettings, ollama_analyze_options: e.target.value })}
+                    rows={4}
+                    className="w-full p-2 rounded border border-border bg-surface text-xs font-mono"
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {pullLogs.length > 0 && (
+        <div ref={pullLogRef} className="p-3 rounded border border-border bg-surface-2 text-xs font-mono max-h-40 overflow-auto">
+          {pullLogs.map((l, i) => <div key={i}>{l}</div>)}
+        </div>
+      )}
+      <div className="flex gap-2 items-center">
+        <button onClick={() => onSave(localSettings)} disabled={saving || !settingsValid}
+          className="px-3 py-2 rounded bg-accent-green text-black text-xs font-bold transition hover:bg-accent-green/90 disabled:opacity-50">
+          {saving ? "Saving…" : "Save Settings"}
+        </button>
+        {!settingsValid && (
+          <span className="text-xs text-accent-red">Please fix system prompt placeholders before saving.</span>
+        )}
+        {status && <span className="text-xs text-accent-green">{status}</span>}
+        {error && <span className="text-xs text-accent-red">{error}</span>}
+      </div>
+    </div>
+  );
+}
+
+
 // ─── root ─────────────────────────────────────────────────────────────────────
 
 export default function App() {
@@ -3182,6 +3871,35 @@ export default function App() {
   const [refreshKey, setRefreshKey] = useState(0);
   const [lists, setLists]           = useState([]);
   const [customCats, setCustomCats] = useState([]);
+  const [llmProvider, setLlmProvider] = useState(null); // "gemini" | "ollama"
+
+  const [settings, setSettings]         = useState(null);
+  const [settingsSaving, setSettingsSaving] = useState(false);
+  const [settingsStatus, setSettingsStatus] = useState("");
+  const [settingsError, setSettingsError] = useState("");
+  const [ollamaStatus, setOllamaStatus] = useState({running: null, models: []});
+  const [reembedProgress, setReembedProgress] = useState(null); // {active, done, total}
+  const [ollamaStatusLoading, setOllamaStatusLoading] = useState(false);
+
+  useEffect(() => {
+    let interval = null;
+
+    const fetchReembedStatus = async () => {
+      try {
+        const res = await fetch(`${API}/entries/embed-all/status`);
+        if (!res.ok) return;
+        const data = await res.json();
+        setReembedProgress(data.active ? data : null);
+      } catch {
+        // ignore
+      }
+    };
+
+    fetchReembedStatus();
+    interval = setInterval(fetchReembedStatus, 3000);
+
+    return () => clearInterval(interval);
+  }, []);
 
   // Analysis state lives here — survives tab switches
   const [input, setInput]       = useState("");
@@ -3191,6 +3909,28 @@ export default function App() {
   useEffect(() => {
     fetch(`${API}/lists`).then(r => r.json()).then(setLists).catch(console.error);
     fetch(`${API}/categories`).then(r => r.json()).then(setCustomCats).catch(console.error);
+    fetch(`${API}/provider`).then(r => r.json()).then(d => setLlmProvider(d.provider || null)).catch(() => {});
+    const loadOllamaStatus = () => {
+      setOllamaStatusLoading(true);
+      fetch(`${API}/ollama/status`).then(r => r.json()).then(d => setOllamaStatus(d)).catch(() => setOllamaStatus({running: false, models: []})).finally(() => setOllamaStatusLoading(false));
+    };
+    loadOllamaStatus();
+    fetch(`${API}/settings`).then(r => r.json()).then(setSettings).catch(err => {
+      console.error(err);
+      setSettings({
+        provider: "ollama",
+        gemini_api_key: "",
+        ollama_url: "http://localhost:11434",
+        ollama_model: "qwen3:4b",
+        ollama_embed_model: "qwen3-embedding:8b",
+        system_prompt_base: "",
+        chat_system_prompt: "",
+        ollama_chat_options: JSON.stringify({ temperature: 0.1, num_predict: 2048, top_k: 50, top_p: 0.95 }, null, 2),
+        ollama_analyze_options: JSON.stringify({ temperature: 0.3, num_predict: 5000, top_k: 10, top_p: 0.05 }, null, 2),
+        ollama_models: ["qwen3:4b", "qwen3:14b", "qwen3:22b", "qwen3:70b"],
+        ollama_embedding_models: ["qwen3-embedding:8b", "qwen3-embedding:14b"],
+      });
+    });
   }, []);
 
   function handleInputChange(val) {
@@ -3215,6 +3955,63 @@ export default function App() {
         ? { ...p, entry: { ...p.entry, list_ids: (p.entry.list_ids || []).filter(id => id !== listId) } }
         : p
     ));
+  }
+
+  async function saveSettings(newSettings) {
+    const toSave = newSettings || settings;
+    if (!toSave) return;
+    setSettingsSaving(true);
+    setSettingsStatus("");
+    setSettingsError("");
+    try {
+      const res = await fetch(`${API}/settings`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(toSave),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "Could not save settings");
+      }
+      setSettings(toSave);
+      setSettingsStatus("Settings saved. Reload or switch tab for the new provider to take effect.");
+      setLlmProvider(data.provider || toSave.provider);
+    } catch (err) {
+      setSettingsError(err.message || "Could not save settings");
+    } finally {
+      setSettingsSaving(false);
+    }
+  }
+
+  async function refreshOllamaStatus() {
+    setOllamaStatusLoading(true);
+    try {
+      const res = await fetch(`${API}/ollama/status`);
+      const data = await res.json();
+      setOllamaStatus(data);
+    } catch (err) {
+      setOllamaStatus({ running: false, models: [] });
+    } finally {
+      setOllamaStatusLoading(false);
+    }
+  }
+
+  async function startOllamaServe() {
+    setOllamaStatusLoading(true);
+    try {
+      const res = await fetch(`${API}/ollama/serve`, { method: "POST" });
+      const data = await res.json();
+      if (!res.ok && !data.ok) {
+        throw new Error(data.error || "Could not start ollama serve");
+      }
+      setOllamaStatus({ running: true, models: [], message: data.message });
+      setTimeout(refreshOllamaStatus, 2000);
+    } catch (err) {
+      setOllamaStatus({ running: false, models: [] });
+      setSettingsError(err.message || "Could not start Ollama");
+    } finally {
+      setOllamaStatusLoading(false);
+    }
   }
 
   async function handleSubmitUrls(urls) {
@@ -3354,6 +4151,7 @@ export default function App() {
               { id: "subscriptions", label: "Subscriptions" },
               { id: "graph",   label: "Graph" },
               { id: "chat",    label: "💬 Chat" },
+              { id: "settings", label: "Settings" },
               { id: "logs",    label: "Logs" },
             ].map(({ id, label }) => (
               <button key={id} onClick={() => setTab(id)}
@@ -3373,10 +4171,15 @@ export default function App() {
       </header>
 
       <main className="flex-1 max-w-7xl mx-auto w-full px-6 py-8">
+        {reembedProgress?.active && (
+          <div className="mb-4 rounded border border-blue-500/40 bg-blue-500/10 px-4 py-2 text-xs text-blue-200">
+            ⏳ Re-embedding: {reembedProgress.done} / {reembedProgress.total} entries
+          </div>
+        )}
         {tab === "analyze" && (
           <AnalyzeTab input={input} setInput={handleInputChange}
             loading={loading} progress={progress} onSubmit={handleSubmit} onBlogSubmit={handleBlogSubmit}
-            onPdfSubmit={handlePdfSubmit}
+            onPdfSubmit={handlePdfSubmit} llmProvider={llmProvider}
             lists={lists} onAddToList={handleAddToList} onRemoveFromList={handleRemoveFromList}
             customCats={customCats}
             onUpdate={updated => setProgress(prev => prev.map(p =>
@@ -3396,7 +4199,23 @@ export default function App() {
         )}
         {tab === "subscriptions" && <RssTab />}
         {tab === "graph" && <GraphTab />}
-        {tab === "chat" && <ChatTab />}
+        {tab === "chat" && <ChatTab reembedProgress={reembedProgress} />}
+        {tab === "settings" && (
+          <SettingsTab
+            settings={settings}
+            onChange={setSettings}
+            onSave={saveSettings}
+            saving={settingsSaving}
+            status={settingsStatus}
+            error={settingsError}
+            ollamaStatus={ollamaStatus}
+            ollamaStatusLoading={ollamaStatusLoading}
+            refreshOllamaStatus={refreshOllamaStatus}
+            startOllamaServe={startOllamaServe}
+            onReembedProgress={setReembedProgress}
+            reembedProgress={reembedProgress}
+          />
+        )}
         {tab === "logs" && <LogsTab />}
       </main>
     </div>
