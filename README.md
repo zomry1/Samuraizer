@@ -267,6 +267,82 @@ python telegram_bot.py
 
 ---
 
+## 🐳 Setup (Docker)
+
+The easiest way to run the full stack — one command builds and starts everything.
+
+### 0) Clone the repo 📥
+
+```bash
+git clone https://github.com/zomry1/Samuraizer.git
+cd Samuraizer
+```
+
+### 1) Config 🔐
+
+```bash
+cp .env.example .env
+# Edit .env and fill in GEMINI_API_KEY (and any other values you need)
+```
+
+### 2) Build & run ▶️
+
+All Docker files live in the `docker/` folder. Run commands from the **project root**:
+
+**Gemini (cloud) — default:**
+```bash
+docker compose -f docker/docker-compose.yml up -d
+```
+
+**Ollama on CPU:**
+```bash
+docker compose -f docker/docker-compose.yml --profile ollama up -d
+```
+
+**Ollama on NVIDIA GPU** *(requires [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html))*:
+```bash
+docker compose -f docker/docker-compose.yml --profile ollama-nvidia up -d
+```
+
+**Ollama on AMD GPU** *(requires ROCm-capable GPU + amdgpu driver)*:
+```bash
+docker compose -f docker/docker-compose.yml --profile ollama-amd up -d
+```
+
+That's it. The frontend is at **http://localhost** and the API at **http://localhost:8000**.
+
+> **Tip:** When using any Ollama profile, set `LLM_PROVIDER=ollama` in your `.env`. The `OLLAMA_URL` is automatically set to `http://ollama:11434` inside the containers — you don't need to change it.
+
+After first start with Ollama, pull the models:
+```bash
+docker exec -it samuraizer-ollama-1 ollama pull qwen3:14b
+docker exec -it samuraizer-ollama-1 ollama pull qwen3-embedding:8b
+```
+
+- Backend and frontend restart automatically on failure.
+- Your database, log, and backups are persisted in the project directory via bind mounts.
+- Ollama model files are stored in the `ollama_data` Docker volume (persists across restarts).
+- The Telegram bot is disabled by default. Combine profiles to enable it alongside Ollama:
+
+```bash
+docker compose -f docker/docker-compose.yml --profile ollama-nvidia --profile bot up -d
+```
+
+### Updating
+
+```bash
+git pull
+docker compose -f docker/docker-compose.yml up -d --build
+```
+
+### Stopping
+
+```bash
+docker compose -f docker/docker-compose.yml down
+```
+
+---
+
 
 <details>
 <summary>📺 YouTube Transcript Fetching</summary>

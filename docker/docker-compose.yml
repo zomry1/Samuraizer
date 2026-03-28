@@ -1,0 +1,103 @@
+name: samuraizer
+
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../samuraizer.db:/app/samuraizer.db
+      - ../samuraizer.log:/app/samuraizer.log
+      - ../db_backups:/app/db_backups
+    env_file:
+      - ../.env
+    environment:
+      # Override OLLAMA_URL so the backend always reaches the ollama container
+      # (takes precedence over the value in .env when the ollama profile is active)
+      OLLAMA_URL: http://ollama:11434
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  telegram-bot:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: python telegram_bot.py
+    env_file:
+      - ../.env
+    environment:
+      OLLAMA_URL: http://ollama:11434
+    depends_on:
+      - backend
+    restart: unless-stopped
+    profiles:
+      - bot
+
+  # ---------------------------------------------------------------------------
+  # Ollama — local LLM inference (CPU by default)
+  # Enable with: docker compose -f docker/docker-compose.yml --profile ollama up -d
+  # ---------------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+    profiles:
+      - ollama
+
+  # ---------------------------------------------------------------------------
+  # Ollama — NVIDIA GPU variant
+  # Requirements: NVIDIA Container Toolkit installed on the host
+  #   https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+  # Enable with: docker compose -f docker/docker-compose.yml --profile ollama-nvidia up -d
+  # ---------------------------------------------------------------------------
+  ollama-nvidia:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    profiles:
+      - ollama-nvidia
+
+  # ---------------------------------------------------------------------------
+  # Ollama — AMD GPU variant
+  # Requirements: ROCm-capable AMD GPU + amdgpu driver on the host
+  # Enable with: docker compose -f docker/docker-compose.yml --profile ollama-amd up -d
+  # ---------------------------------------------------------------------------
+  ollama-amd:
+    image: ollama/ollama:rocm
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    restart: unless-stopped
+    profiles:
+      - ollama-amd
+
+volumes:
+  ollama_data:
