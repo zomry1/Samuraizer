@@ -170,7 +170,12 @@ flowchart LR
 
 ---
 
-## ⚙️ Setup (Local)
+## 🚀 Setup
+
+Choose your preferred setup method:
+
+<details>
+<summary><b>⚙️ Local Setup (manual install)</b></summary>
 
 ### 0) Clone the repo 📥
 
@@ -265,9 +270,10 @@ npm run dev
 python telegram_bot.py
 ```
 
----
+</details>
 
-## 🐳 Setup (Docker)
+<details>
+<summary><b>🐳 Docker Setup (recommended)</b></summary>
 
 The easiest way to run the full stack — one command builds and starts everything.
 
@@ -299,12 +305,43 @@ docker compose -f docker/docker-compose.yml up -d
 docker compose -f docker/docker-compose.yml --profile ollama up -d
 ```
 
-**Ollama on NVIDIA GPU** *(requires [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html))*:
+**Ollama on NVIDIA GPU:**
 ```bash
 docker compose -f docker/docker-compose.yml --profile ollama-nvidia up -d
 ```
 
-**Ollama on AMD GPU** *(requires ROCm-capable GPU + amdgpu driver)*:
+<details>
+<summary>Prerequisites for NVIDIA GPU</summary>
+
+**Windows (WSL 2):**
+1. Install the latest [NVIDIA Game Ready / Studio drivers](https://www.nvidia.com/Download/index.aspx) on Windows — no separate Linux driver needed inside WSL.
+2. Install WSL 2: open PowerShell as Administrator and run:
+   ```powershell
+   wsl --install
+   wsl --update
+   ```
+3. Install [Docker Desktop for Windows](https://www.docker.com/products/docker-desktop/) and in its settings:
+   - **General** → enable *"Use the WSL 2 based engine"*
+   - **Resources → WSL Integration** → enable for your distro
+
+Docker Desktop for Windows bundles the NVIDIA container runtime automatically — no extra steps needed.
+
+**Linux:**
+
+Install the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html):
+```bash
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+  sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+  sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+```
+
+</details>
+
+**Ollama on AMD GPU** *(requires ROCm-capable GPU + amdgpu driver on Linux)*:
 ```bash
 docker compose -f docker/docker-compose.yml --profile ollama-amd up -d
 ```
@@ -313,14 +350,23 @@ That's it. The frontend is at **http://localhost** and the API at **http://local
 
 > **Tip:** When using any Ollama profile, set `LLM_PROVIDER=ollama` in your `.env`. The `OLLAMA_URL` is automatically set to `http://ollama:11434` inside the containers — you don't need to change it.
 
-After first start with Ollama, pull the models:
+After first start with Ollama, pull the models (use the container name matching the profile you started):
 ```bash
-docker exec -it samuraizer-ollama-1 ollama pull qwen3:14b
+# --profile ollama
+docker exec -it samuraizer-ollama-1 ollama pull qwen3:4b
 docker exec -it samuraizer-ollama-1 ollama pull qwen3-embedding:8b
+
+# --profile ollama-nvidia
+docker exec -it samuraizer-ollama-nvidia-1 ollama pull qwen3:4b
+docker exec -it samuraizer-ollama-nvidia-1 ollama pull qwen3-embedding:8b
+
+# --profile ollama-amd
+docker exec -it samuraizer-ollama-amd-1 ollama pull qwen3:4b
+docker exec -it samuraizer-ollama-amd-1 ollama pull qwen3-embedding:8b
 ```
 
 - Backend and frontend restart automatically on failure.
-- Your database, log, and backups are persisted in the project directory via bind mounts.
+- Docker stores the database and log file under the project's `data/` directory and backups under `db_backups/`.
 - Ollama model files are stored in the `ollama_data` Docker volume (persists across restarts).
 - The Telegram bot is disabled by default. Combine profiles to enable it alongside Ollama:
 
@@ -340,6 +386,8 @@ docker compose -f docker/docker-compose.yml up -d --build
 ```bash
 docker compose -f docker/docker-compose.yml down
 ```
+
+</details>
 
 ---
 

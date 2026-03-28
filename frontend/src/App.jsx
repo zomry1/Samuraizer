@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import * as d3 from "d3";
 
-const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
+const API = import.meta.env.VITE_API_URL || "";
 
 const CATEGORIES = ["all", "tool", "agent", "mcp", "list", "workflow", "cve", "article", "video", "playlist", "blog"];
 

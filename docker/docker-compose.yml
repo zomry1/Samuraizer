@@ -1,5 +1,9 @@
 name: samuraizer
 
+networks:
+  default:
+    name: samuraizer-net
+
 services:
   backend:
     build:
@@ -8,14 +12,18 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ../samuraizer.db:/app/samuraizer.db
-      - ../samuraizer.log:/app/samuraizer.log
+      - ../data:/data
       - ../db_backups:/app/db_backups
     env_file:
       - ../.env
     environment:
-      # Override OLLAMA_URL so the backend always reaches the ollama container
-      # (takes precedence over the value in .env when the ollama profile is active)
+      SAMURAIZER_HOST: 0.0.0.0
+      SAMURAIZER_PORT: 8000
+      SAMURAIZER_DATA_DIR: /data
+      SAMURAIZER_DB_PATH: /data/samuraizer.db
+      SAMURAIZER_LOG_PATH: /data/samuraizer.log
+      SAMURAIZER_BACKUP_DIR: /app/db_backups
+      FLASK_DEBUG: "false"
       OLLAMA_URL: http://ollama:11434
     restart: unless-stopped
 
@@ -37,7 +45,14 @@ services:
     env_file:
       - ../.env
     environment:
+      SAMURAIZER_DATA_DIR: /data
+      SAMURAIZER_DB_PATH: /data/samuraizer.db
+      SAMURAIZER_LOG_PATH: /data/samuraizer.log
+      SAMURAIZER_BACKUP_DIR: /app/db_backups
       OLLAMA_URL: http://ollama:11434
+    volumes:
+      - ../data:/data
+      - ../db_backups:/app/db_backups
     depends_on:
       - backend
     restart: unless-stopped
@@ -54,6 +69,10 @@ services:
       - "11434:11434"
     volumes:
       - ollama_data:/root/.ollama
+    networks:
+      default:
+        aliases:
+          - ollama
     restart: unless-stopped
     profiles:
       - ollama
@@ -70,6 +89,10 @@ services:
       - "11434:11434"
     volumes:
       - ollama_data:/root/.ollama
+    networks:
+      default:
+        aliases:
+          - ollama
     deploy:
       resources:
         reservations:
@@ -92,6 +115,10 @@ services:
       - "11434:11434"
     volumes:
       - ollama_data:/root/.ollama
+    networks:
+      default:
+        aliases:
+          - ollama
     devices:
       - /dev/kfd
       - /dev/dri

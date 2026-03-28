@@ -31,6 +31,24 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+BASE_DIR = os.path.dirname(__file__)
+DATA_DIR = os.environ.get("SAMURAIZER_DATA_DIR", BASE_DIR)
+LOG_PATH = os.environ.get("SAMURAIZER_LOG_PATH", os.path.join(DATA_DIR, "samuraizer.log"))
+DB_PATH = os.environ.get("SAMURAIZER_DB_PATH", os.path.join(DATA_DIR, "samuraizer.db"))
+BACKUP_DIR = os.environ.get("SAMURAIZER_BACKUP_DIR", os.path.join(BASE_DIR, "db_backups"))
+
+
+def _ensure_parent_dir(path: str):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+_ensure_parent_dir(LOG_PATH)
+_ensure_parent_dir(DB_PATH)
+APP_HOST = os.environ.get("SAMURAIZER_HOST", "127.0.0.1")
+APP_PORT = int(os.environ.get("SAMURAIZER_PORT", "8000"))
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -40,7 +58,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("samuraizer.log", encoding="utf-8"),
+        logging.FileHandler(LOG_PATH, encoding="utf-8"),
     ],
 )
 logger = logging.getLogger(__name__)
@@ -96,10 +114,6 @@ _embed_all_status = {
 }
 
 app = Flask(__name__)
-DB_PATH = os.path.join(os.path.dirname(__file__), "samuraizer.db")
-BACKUP_DIR = os.path.join(os.path.dirname(__file__), "db_backups")
-
-
 def _ensure_backup_dir():
     os.makedirs(BACKUP_DIR, exist_ok=True)
 
@@ -3741,4 +3755,4 @@ if not _debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
     _start_backup_scheduler(12)
 
 _start_rss_scheduler()
-app.run(port=8000, debug=_debug, use_reloader=_debug)
+app.run(host=APP_HOST, port=APP_PORT, debug=_debug, use_reloader=_debug)
