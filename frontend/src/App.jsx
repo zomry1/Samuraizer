@@ -205,14 +205,14 @@ export default function App() {
     await handleSubmitUrls(urls);
   }
 
-  async function handlePdfSubmit(file) {
+  async function handleFileSubmit(file) {
     if (loading) return;
     setLoading(true);
     setProgress([{ url: file.name, status: "pending", logs: [] }]);
     const formData = new FormData();
     formData.append("file", file);
     try {
-      const res     = await fetch(`${API}/analyze-pdf`, { method: "POST", body: formData });
+      const res     = await fetch(`${API}/analyze-file`, { method: "POST", body: formData });
       const reader  = res.body.getReader();
       const decoder = new TextDecoder();
       let   buffer  = "";
@@ -326,7 +326,7 @@ export default function App() {
         {tab === "analyze" && (
           <AnalyzeTab input={input} setInput={handleInputChange}
             loading={loading} progress={progress} onSubmit={handleSubmit} onBlogSubmit={handleBlogSubmit}
-            onPdfSubmit={handlePdfSubmit} llmProvider={llmProvider}
+            onPdfSubmit={handleFileSubmit} llmProvider={llmProvider}
             lists={lists} onAddToList={handleAddToList} onRemoveFromList={handleRemoveFromList}
             customCats={customCats}
             onUpdate={updated => setProgress(prev => prev.map(p =>

@@ -207,6 +207,94 @@ def fetch_article_content(url: str, return_title: bool = False):
 
 
 # ---------------------------------------------------------------------------
+# File/document extraction
+# ---------------------------------------------------------------------------
+SUPPORTED_FILE_EXTENSIONS = {"pdf", "docx", "pptx", "txt", "md"}
+
+
+def get_url_extension(url: str) -> str | None:
+    from urllib.parse import urlparse
+    path = urlparse(url).path or ""
+    if "." not in path:
+        return None
+    ext = path.rsplit(".", 1)[-1].lower()
+    return ext if ext in SUPPORTED_FILE_EXTENSIONS else None
+
+
+def is_document_url(url: str) -> bool:
+    return get_url_extension(url) is not None
+
+
+def extract_text_file(file_bytes: bytes, extension: str) -> str:
+    if extension == "txt" or extension == "md":
+        for encoding in ("utf-8", "utf-16", "latin-1"):
+            try:
+                text = file_bytes.decode(encoding)
+                if text.strip():
+                    return text
+            except Exception:
+                continue
+        raise RuntimeError("Could not decode text file with utf-8/utf-16/latin-1")
+
+    if extension == "docx":
+        from io import BytesIO
+        from docx import Document
+
+        doc = Document(BytesIO(file_bytes))
+        parts = []
+        for para in doc.paragraphs:
+            if para.text.strip():
+                parts.append(para.text)
+        for table in doc.tables:
+            for row in table.rows:
+                row_cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                if row_cells:
+                    parts.append("\t".join(row_cells))
+        content = "\n".join(parts)
+        if not content.strip():
+            raise RuntimeError("DOCX contains no text")
+        return content
+
+    if extension == "pptx":
+        from io import BytesIO
+        from pptx import Presentation
+
+        prs = Presentation(BytesIO(file_bytes))
+        parts = []
+        for slide in prs.slides:
+            for shape in slide.shapes:
+                if hasattr(shape, "text") and shape.text.strip():
+                    parts.append(shape.text.strip())
+                elif hasattr(shape, "text_frame") and shape.text_frame is not None:
+                    parts.append(shape.text_frame.text.strip())
+        content = "\n".join([p for p in parts if p])
+        if not content.strip():
+            raise RuntimeError("PPTX contains no text")
+        return content
+
+    raise RuntimeError(f"Unsupported extension for file text extraction: {extension}")
+
+
+def fetch_file_content(url: str) -> tuple[str, list[str]]:
+    ext = get_url_extension(url)
+    if not ext:
+        raise RuntimeError("Unsupported document URL extension")
+
+    logs = [f"Document URL detected ({ext}) — downloading"]
+    r = requests.get(url, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f"Failed to download document ({r.status_code})")
+
+    if ext == "pdf":
+        raise RuntimeError("PDF should be processed through PDF-specific path")
+
+    logs.append(f"Downloaded {len(r.content):,} bytes")
+    content = extract_text_file(r.content, ext)
+    logs.append(f"Extracted {len(content):,} chars from {ext}")
+    return content, logs
+
+
+# ---------------------------------------------------------------------------
 # Blog listing detection + link extraction
 # ---------------------------------------------------------------------------
 BLOG_PATH_RE = re.compile(

@@ -15,4 +15,6 @@ curl-cffi
 playwright
 browserforge
 pymupdf
+python-docx
+python-pptx
 json-repair

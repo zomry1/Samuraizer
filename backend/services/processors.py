@@ -28,6 +28,10 @@ from backend.services.content import (
     fetch_article_content,
     is_blog_listing_url,
     extract_blog_links,
+    get_url_extension,
+    is_document_url,
+    fetch_file_content,
+    extract_text_file,
     YT_OEMBED,
 )
 
@@ -375,6 +379,61 @@ def process_blog_listing(url: str, selected_urls: list | None = None, listing_ti
         db.close()
 
 
+def _category_from_ext(ext: str) -> tuple[str, str]:
+    if ext == "docx":
+        return "document", "docx"
+    if ext == "pptx":
+        return "presentation", "pptx"
+    if ext == "txt":
+        return "text", "text"
+    if ext == "md":
+        return "article", "markdown"
+    if ext == "pdf":
+        return "pdf", "pdf"
+    return "article", "manual"
+
+
+def _process_extracted_content(url: str, content: str, source: str, category: str, deterministic_name: str | None = None):
+    def log(msg):
+        logger.info("[%s] %s", url, msg)
+        return {"type": "log", "msg": msg}
+
+    db = sqlite3.connect(cfg.DB_PATH)
+    db.row_factory = sqlite3.Row
+    try:
+        custom_cats = [dict(r) for r in db.execute("SELECT slug, label FROM custom_categories ORDER BY id").fetchall()]
+
+        for msg in ollama_pre_flight_logs():
+            yield log(msg)
+
+        result, gemini_logs = call_gemini(content, custom_cats)
+        for msg in gemini_logs:
+            yield log(msg)
+
+        if deterministic_name:
+            result["name"] = deterministic_name
+        if category:
+            result["category"] = category
+
+        cur = db.execute(
+            "INSERT INTO entries (url, name, bullets, category, tags, content, source) VALUES (?,?,?,?,?,?,?)",
+            (url, result["name"], json.dumps(result["bullets"]), result["category"], json.dumps(result["tags"]), content, source),
+        )
+        db.commit()
+        yield log("Saved to knowledge base")
+
+        try:
+            store_entry_embedding(db, cur.lastrowid, result["name"], result["bullets"], result["tags"], content)
+            yield log("Embedding stored")
+        except Exception as exc:
+            yield log(f"Embedding skipped: {exc}")
+
+        row = db.execute("SELECT * FROM entries WHERE id = ?", (cur.lastrowid,)).fetchone()
+        yield {"type": "result", "entry": row_to_dict(row, db)}
+    finally:
+        db.close()
+
+
 # ---------------------------------------------------------------------------
 # Single URL processor
 # ---------------------------------------------------------------------------
@@ -411,25 +470,49 @@ def process_url(url: str, source: str = "manual"):
 
         deterministic_name = None
         deterministic_category = None
-        try:
-            if extract_video_id(url):
-                content, fetch_logs, page_title = fetch_youtube_content(url)
-                deterministic_name = page_title or url
-                deterministic_category = "video"
-            elif GH_REPO_RE.match(url):
-                content, fetch_logs = fetch_github_content(url)
-                gh_match = GH_REPO_RE.match(url)
-                deterministic_name = f"{gh_match.group('repo')}" if gh_match else url
-            else:
-                content, fetch_logs, page_title = fetch_article_content(url, return_title=True)
-                deterministic_name = page_title or url
-            for msg in fetch_logs:
-                yield log(msg)
-        except Exception as exc:
-            msg = f"Fetch failed: {exc}"
-            logger.error("[%s] %s", url, msg)
-            yield {"type": "error", "msg": msg}
-            return
+        source = source
+
+        ext = get_url_extension(url)
+        if ext:
+            if ext == "pdf":
+                try:
+                    r = requests.get(url, timeout=30)
+                    r.raise_for_status()
+                    filename = os.path.basename(urlparse(url).path) or url
+                    yield from process_pdf(r.content, filename)
+                    return
+                except Exception as exc:
+                    yield {"type": "error", "msg": f"PDF fetch failed: {exc}"}
+                    return
+            try:
+                content, fetch_logs = fetch_file_content(url)
+                deterministic_name = os.path.basename(urlparse(url).path) or url
+                deterministic_category, source = _category_from_ext(ext)
+                for msg in fetch_logs:
+                    yield log(msg)
+            except Exception as exc:
+                yield {"type": "error", "msg": f"Document fetch failed: {exc}"}
+                return
+        else:
+            try:
+                if extract_video_id(url):
+                    content, fetch_logs, page_title = fetch_youtube_content(url)
+                    deterministic_name = page_title or url
+                    deterministic_category = "video"
+                elif GH_REPO_RE.match(url):
+                    content, fetch_logs = fetch_github_content(url)
+                    gh_match = GH_REPO_RE.match(url)
+                    deterministic_name = f"{gh_match.group('repo')}" if gh_match else url
+                else:
+                    content, fetch_logs, page_title = fetch_article_content(url, return_title=True)
+                    deterministic_name = page_title or url
+                for msg in fetch_logs:
+                    yield log(msg)
+            except Exception as exc:
+                msg = f"Fetch failed: {exc}"
+                logger.error("[%s] %s", url, msg)
+                yield {"type": "error", "msg": msg}
+                return
 
         for msg in ollama_pre_flight_logs():
             yield log(msg)
@@ -471,6 +554,46 @@ def process_url(url: str, source: str = "manual"):
         yield {"type": "result", "entry": row_to_dict(row, db)}
     finally:
         db.close()
+
+
+def process_file_upload(file_bytes: bytes, filename: str):
+    ext = os.path.splitext(filename)[1].lower().lstrip(".")
+    if not ext:
+        yield {"type": "error", "msg": "Filename has no extension"}
+        return
+
+    if ext == "pdf":
+        yield from process_pdf(file_bytes, filename)
+        return
+
+    if ext not in {"docx", "pptx", "txt", "md"}:
+        yield {"type": "error", "msg": f"Unsupported file type: .{ext}"}
+        return
+
+    try:
+        content = extract_text_file(file_bytes, ext)
+    except Exception as exc:
+        yield {"type": "error", "msg": f"File extraction failed: {exc}"}
+        return
+
+    source_category, source_value = _category_from_ext(ext)
+    synthetic_url = f"{ext}:{hashlib.sha256(file_bytes).hexdigest()}"
+    deterministic_name = os.path.splitext(os.path.basename(filename))[0] or filename
+
+    # Reuse logic from process_url by inserting directly
+    db = sqlite3.connect(cfg.DB_PATH)
+    db.row_factory = sqlite3.Row
+    try:
+        row = db.execute("SELECT * FROM entries WHERE url = ?", (synthetic_url,)).fetchone()
+        if row:
+            yield {"type": "log", "msg": "Already analyzed — returning saved entry"}
+            yield {"type": "result", "entry": row_to_dict(row, db)}
+            return
+
+    finally:
+        db.close()
+
+    yield from _process_extracted_content(synthetic_url, content, source_value, source_category, deterministic_name)
 
 
 # ---------------------------------------------------------------------------

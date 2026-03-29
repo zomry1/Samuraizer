@@ -47,7 +47,8 @@ Every security researcher knows the feeling — you find an interesting GitHub r
 
 ### 🔍 Analyze — Paste URLs, watch results stream
 - 📝 Paste one or more URLs (GitHub repos, CVE writeups, blog posts, YouTube videos) — results stream back in real time
-- 📄 **Upload PDF files** directly from the browser or Telegram — full text extracted, analyzed, stored, and viewable in the UI
+- 📄 **Upload files** directly from the browser or Telegram — full text extracted, analyzed, stored, and viewable in the UI
+  - supported formats: `.pdf`, `.docx`, `.pptx`, `.txt`, `.md`
 - 🗞️ Blog scanner: paste a blog homepage and extract all article links for batch analysis in one click
 - ✨ **Suggested Read**: a relevant unread entry is surfaced on the Analyze tab each session to keep your queue moving
 

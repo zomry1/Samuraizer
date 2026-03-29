@@ -13,7 +13,7 @@ export default function AnalyzeTab({ input, setInput, loading, progress, onSubmi
   const [scanError,    setScanError]    = useState("");
   const [scanTitle,    setScanTitle]    = useState("");
   const [scanLinks,    setScanLinks]    = useState([]); // [{url, title, selected}]
-  const [pdfFile,      setPdfFile]      = useState(null);
+  const [selectedFile, setSelectedFile] = useState(null);
   const urls   = parseUrls(input);
   const isBulk = urls.length > 1;
   const done   = progress.filter(p => p.status !== "pending").length;
@@ -21,8 +21,8 @@ export default function AnalyzeTab({ input, setInput, loading, progress, onSubmi
 
   function handleFormSubmit(e) {
     e.preventDefault();
-    if (pdfFile) { onPdfSubmit(pdfFile); }
-    else         { onSubmit(e); }
+    if (selectedFile) { onPdfSubmit(selectedFile); }
+    else              { onSubmit(e); }
   }
 
   async function handleScan(e) {
@@ -73,7 +73,7 @@ export default function AnalyzeTab({ input, setInput, loading, progress, onSubmi
         <div className="flex-1 min-w-0">
           <form onSubmit={handleFormSubmit} className="flex flex-col gap-2">
             <div className="relative bg-surface-1 border border-border rounded focus-within:border-accent-green/50 transition-colors">
-              <textarea value={input} onChange={e => { setInput(e.target.value); setPdfFile(null); }}
+              <textarea value={input} onChange={e => { setInput(e.target.value); setSelectedFile(null); }}
                 placeholder={"Paste one or more URLs (one per line):\nhttps://github.com/...\nhttps://blog.example.com/..."}
                 disabled={loading}
                 rows={Math.min(Math.max(urls.length + 1, 2), 8)}
@@ -85,13 +85,13 @@ export default function AnalyzeTab({ input, setInput, loading, progress, onSubmi
               )}
             </div>
             <div className="flex items-center gap-3">
-              <button type="submit" disabled={loading || (!pdfFile && urls.length === 0)}
+              <button type="submit" disabled={loading || (!selectedFile && urls.length === 0)}
                 className="px-5 py-2 rounded text-sm font-bold bg-accent-green/10 text-accent-green border border-accent-green/40
                            hover:bg-accent-green/20 disabled:opacity-30 disabled:cursor-not-allowed transition-colors flex items-center gap-2">
                 {loading && <Spinner sm />}
                 {loading
-                  ? (pdfFile ? "Analyzing PDF…" : (isBulk ? `Analyzing ${done}/${total}…` : "Analyzing…"))
-                  : (pdfFile ? `[ ANALYZE PDF ]` : (isBulk ? `[ ANALYZE ${urls.length} ]` : "[ ANALYZE ]"))}
+                  ? (selectedFile ? "Analyzing file…" : (isBulk ? `Analyzing ${done}/${total}…` : "Analyzing…"))
+                  : (selectedFile ? `[ ANALYZE FILE ]` : (isBulk ? `[ ANALYZE ${urls.length} ]` : "[ ANALYZE ]"))}
               </button>
               {loading && isBulk && (
                 <div className="flex-1 h-1.5 bg-surface-2 rounded-full overflow-hidden">
@@ -102,20 +102,20 @@ export default function AnalyzeTab({ input, setInput, loading, progress, onSubmi
             </div>
             <div className="flex items-center gap-2">
               <label className={`flex items-center gap-2 cursor-pointer select-none text-xs transition-colors ${
-                pdfFile ? "text-accent-green" : "text-gray-600 hover:text-gray-400"
+                selectedFile ? "text-accent-green" : "text-gray-600 hover:text-gray-400"
               } ${loading ? "opacity-40 pointer-events-none" : ""}` }>
-                <input type="file" accept=".pdf" className="hidden" disabled={loading}
+                <input type="file" accept=".pdf,.docx,.pptx,.txt,.md" className="hidden" disabled={loading}
                   onChange={e => {
                     const f = e.target.files?.[0];
-                    if (f) { setPdfFile(f); setInput(""); }
+                    if (f) { setSelectedFile(f); setInput(""); }
                     e.target.value = "";
                   }} />
                 <span className="px-3 py-1.5 rounded border border-border bg-surface-1 hover:border-gray-500 transition-colors whitespace-nowrap overflow-hidden max-w-xs text-ellipsis">
-                  📄 {pdfFile ? pdfFile.name : "Upload PDF"}
+                  📄 {selectedFile ? selectedFile.name : "Upload file (PDF | DOCX | PPTX | TXT)"}
                 </span>
               </label>
-              {pdfFile && (
-                <button type="button" onClick={() => setPdfFile(null)} disabled={loading}
+              {selectedFile && (
+                <button type="button" onClick={() => setSelectedFile(null)} disabled={loading}
                   className="text-xs text-gray-700 hover:text-accent-red transition-colors disabled:opacity-30">
                   ✕
                 </button>

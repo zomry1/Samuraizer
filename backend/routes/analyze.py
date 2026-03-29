@@ -12,7 +12,7 @@ from scrapling import Fetcher as ScraplingFetcher
 import backend.config as cfg
 from backend.logging_setup import logger
 from backend.database import row_to_dict
-from backend.services.processors import process_url, process_pdf, process_blog_listing
+from backend.services.processors import process_url, process_pdf, process_file_upload, process_blog_listing
 from backend.services.content import extract_blog_links
 
 bp = Blueprint("analyze", __name__)
@@ -63,6 +63,30 @@ def analyze_pdf():
 
     def generate():
         for event in process_pdf(file_bytes, filename):
+            if event["type"] == "log":
+                yield json.dumps({"url": filename, "log": event["msg"]}) + "\n"
+            elif event["type"] == "result":
+                yield json.dumps({"url": filename, "entry": event["entry"]}) + "\n"
+            elif event["type"] == "error":
+                yield json.dumps({"url": filename, "error": event["msg"]}) + "\n"
+
+    return Response(stream_with_context(generate()), mimetype="application/x-ndjson")
+
+
+@bp.route("/analyze-file", methods=["POST"])
+def analyze_file():
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+    uploaded = request.files["file"]
+    if not uploaded.filename:
+        return jsonify({"error": "Filename missing"}), 400
+
+    filename = uploaded.filename
+    file_bytes = uploaded.read()
+    logger.info("Analyze-file request: %s (%d bytes)", filename, len(file_bytes))
+
+    def generate():
+        for event in process_file_upload(file_bytes, filename):
             if event["type"] == "log":
                 yield json.dumps({"url": filename, "log": event["msg"]}) + "\n"
             elif event["type"] == "result":
